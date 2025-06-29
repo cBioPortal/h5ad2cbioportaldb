@@ -1017,11 +1017,15 @@ class H5adImporter:
         gene_mapping: Dict[str, Any],
         interrupt_handler: InterruptibleImport,
     ) -> None:
-        """Optimized streaming with persistent file handle."""
+        """Highly optimized streaming with vectorized operations and efficient batching."""
         
-        # Get valid gene indices
-        valid_gene_indices = [g["idx"] for g in gene_mapping["mapped"]]
+        # Get valid gene indices as numpy array for faster indexing
+        valid_gene_indices = np.array([g["idx"] for g in gene_mapping["mapped"]], dtype=np.int32)
         logger.info(f"Processing {len(valid_gene_indices)} mapped genes")
+        
+        # Use larger batch sizes for better performance
+        cell_batch_size = max(self.batch_size, 5000)  # Larger batches for cells
+        expr_batch_size = max(self.batch_size * 10, 50000)  # Much larger batches for expression data
         
         # Open file once and keep handle
         logger.info("Opening h5ad file for streaming...")
@@ -1031,55 +1035,54 @@ class H5adImporter:
         interrupt_handler.add_cleanup(lambda: adata_stream.file.close() if hasattr(adata_stream, 'file') and adata_stream.file else None)
         
         try:
-            # Process in batches
-            batch_size = self.batch_size
             total_cells = len(obs_df)
-            total_batches = (total_cells + batch_size - 1) // batch_size
+            total_batches = (total_cells + cell_batch_size - 1) // cell_batch_size
             
-            logger.info(f"Processing {total_cells} cells in {total_batches} batches of {batch_size}")
+            logger.info(f"Processing {total_cells} cells in {total_batches} batches of {cell_batch_size}")
             
-            # Use tqdm for the main batch progress instead of logging
+            # Pre-compute mapping arrays for vectorized operations
+            cell_ids = obs_df.index.astype(str).values
+            sample_ids = np.array([resolved_mappings.get(cid, {}).get("sample_id") for cid in cell_ids])
+            patient_ids = np.array([resolved_mappings.get(cid, {}).get("patient_id") for cid in cell_ids])
+            mapping_strategies = np.array([resolved_mappings.get(cid, {}).get("strategy", "no_mapping") for cid in cell_ids])
+            
+            # Pre-compute cell type data
+            if cell_type_column and cell_type_column in obs_df.columns:
+                cell_types = obs_df[cell_type_column].fillna("Unknown").astype(str).values
+            else:
+                cell_types = np.full(total_cells, "Unknown", dtype=str)
+            
+            # Pre-serialize obs data in batches to reduce JSON overhead
+            obs_data_json = self._batch_serialize_obs_data(obs_df)
+            
+            # Use tqdm for the main batch progress
             with tqdm(total=total_batches, desc="Processing cell batches", unit="batch") as main_pbar:
-                for batch_num, batch_start in enumerate(range(0, total_cells, batch_size), 1):
-                    # Check for interrupts at the start of each batch
+                for batch_num, batch_start in enumerate(range(0, total_cells, cell_batch_size), 1):
                     interrupt_handler.check_interrupted()
                     
-                    batch_end = min(batch_start + batch_size, total_cells)
-                    batch_cells = obs_df.iloc[batch_start:batch_end]
+                    batch_end = min(batch_start + cell_batch_size, total_cells)
+                    batch_size_actual = batch_end - batch_start
                     
                     main_pbar.set_description(f"Batch {batch_num}/{total_batches}")
                     
-                    # Prepare cell records for this batch
-                    cell_records = []
-                    for cell_id, row in batch_cells.iterrows():
-                        mapping_info = resolved_mappings.get(str(cell_id), {})
-                        
-                        record = {
-                            "dataset_id": dataset_id,
-                            "cell_id": str(cell_id),
-                            "cell_barcode": row.get("barcode", str(cell_id)),
-                            "sample_unique_id": mapping_info.get("sample_id"),
-                            "patient_unique_id": mapping_info.get("patient_id"),
-                            "original_cell_type": row.get(cell_type_column, "Unknown") if cell_type_column else "Unknown",
-                            "harmonized_cell_type_id": None,
-                            "harmonization_confidence": None,
-                            "mapping_strategy": mapping_info.get("strategy", "no_mapping"),
-                            "obs_data": json.dumps(row.to_dict()),
-                        }
-                        cell_records.append(record)
+                    # Vectorized cell record preparation
+                    cell_records = self._prepare_cell_records_vectorized(
+                        dataset_id, batch_start, batch_end, cell_ids, sample_ids,
+                        patient_ids, cell_types, mapping_strategies, obs_data_json, obs_df
+                    )
                     
                     # Insert cell records
                     logger.debug(f"Inserting {len(cell_records)} cell records")
                     self.integration.insert_cells(cell_records)
                     
-                    # Check for interrupts before expression processing
                     interrupt_handler.check_interrupted()
                     
-                    # Process expression data for this batch with persistent handle
+                    # Process expression data with optimized batching
                     logger.debug(f"Processing expression data for batch {batch_num}")
-                    self._stream_expression_batch_optimized(
+                    self._stream_expression_batch_ultra_optimized(
                         adata_stream, dataset_id, batch_start, batch_end, 
-                        valid_gene_indices, matrix_type, cell_records
+                        valid_gene_indices, matrix_type, cell_ids[batch_start:batch_end],
+                        expr_batch_size
                     )
                     
                     # Update main progress bar

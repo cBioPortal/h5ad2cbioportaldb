@@ -172,6 +172,12 @@ class CBioPortalClient:
                 if "already exists" not in str(e).lower():
                     logger.error(f"Failed to create table: {e}")
                     raise
+        
+        # Create optimized views after tables
+        try:
+            self.create_expression_views()
+        except Exception as e:
+            logger.warning(f"Failed to create expression views: {e}")
 
     def _get_datasets_table_ddl(self) -> str:
         """Get DDL for scRNA_datasets table."""
@@ -252,8 +258,50 @@ class CBioPortalClient:
             gene_idx UInt32,
             matrix_type String,
             count Float32 CODEC(DoubleDelta, LZ4)
-        ) ENGINE = SharedMergeTree() ORDER BY (dataset_id, cell_id, gene_idx, matrix_type)
+        ) ENGINE = SharedMergeTree() 
+        ORDER BY (dataset_id, gene_idx, cell_id, matrix_type)
+        SETTINGS index_granularity = 8192
         """
+
+    def create_expression_views(self) -> None:
+        """Create materialized views for common expression queries."""
+        
+        # View 1: Gene-centric view for single gene queries
+        gene_view_ddl = f"""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {self.database}.{self.table_prefix}expression_by_gene
+        ENGINE = SharedMergeTree()
+        ORDER BY (gene_idx, dataset_id, cell_id)
+        AS SELECT *
+        FROM {self.database}.{self.table_prefix}expression_matrix
+        """
+        
+        # View 2: Cell-centric aggregated view for QC metrics
+        cell_qc_view_ddl = f"""
+        CREATE MATERIALIZED VIEW IF NOT EXISTS {self.database}.{self.table_prefix}cell_qc_metrics
+        ENGINE = SharedMergeTree()
+        ORDER BY (dataset_id, cell_id)
+        AS SELECT 
+            dataset_id,
+            cell_id,
+            matrix_type,
+            count() as n_genes_detected,
+            sum(count) as total_counts,
+            avg(count) as mean_expression,
+            quantile(0.5)(count) as median_expression
+        FROM {self.database}.{self.table_prefix}expression_matrix
+        WHERE count > 0
+        GROUP BY dataset_id, cell_id, matrix_type
+        """
+        
+        views = [gene_view_ddl, cell_qc_view_ddl]
+        
+        for ddl in views:
+            try:
+                self.command(ddl)
+                logger.debug(f"View creation executed: {ddl[:100]}...")
+            except Exception as e:
+                if "already exists" not in str(e).lower():
+                    logger.warning(f"Failed to create view: {e}")
 
     def get_existing_studies(self) -> pd.DataFrame:
         """Get all existing cancer studies."""
@@ -309,6 +357,40 @@ class CBioPortalClient:
           AND gad.hugo_gene_symbol = %(gene)s
           AND gad.profile_type = 'rna_seq_mrna'
         """, {"study": study_id, "gene": gene_symbol})
+
+    def get_expression_matrix_wide(self, dataset_id: str, gene_symbols: List[str], cell_ids: Optional[List[str]] = None) -> pd.DataFrame:
+        """Get expression data in wide format (genes as columns) for analysis."""
+        
+        # Build gene filter
+        gene_filter = "AND g.hugo_gene_symbol IN (" + ",".join([f"'{g}'" for g in gene_symbols]) + ")"
+        
+        # Build cell filter
+        cell_filter = ""
+        if cell_ids:
+            cell_filter = "AND e.cell_id IN (" + ",".join([f"'{c}'" for c in cell_ids]) + ")"
+        
+        query = f"""
+        SELECT 
+            e.cell_id,
+            g.hugo_gene_symbol,
+            e.count
+        FROM {self.database}.{self.table_prefix}expression_matrix e
+        JOIN {self.database}.{self.table_prefix}dataset_genes g 
+            ON e.dataset_id = g.dataset_id AND e.gene_idx = g.gene_idx
+        WHERE e.dataset_id = %(dataset_id)s
+        {gene_filter}
+        {cell_filter}
+        """
+        
+        # Get long format data
+        df_long = self.query(query, {"dataset_id": dataset_id})
+        
+        # Pivot to wide format
+        if len(df_long) > 0:
+            df_wide = df_long.pivot(index='cell_id', columns='hugo_gene_symbol', values='count').fillna(0)
+            return df_wide
+        else:
+            return pd.DataFrame()
 
     def close(self) -> None:
         """Close database connection."""
