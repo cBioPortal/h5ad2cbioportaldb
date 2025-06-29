@@ -240,19 +240,31 @@ class CBioPortalClient:
         """Get existing samples, optionally filtered by study."""
         if study_id:
             return self.query(
-                "SELECT * FROM sample WHERE cancer_study_identifier = %(study)s",
+                "SELECT * FROM sample_derived WHERE cancer_study_identifier = %(study)s",
                 {"study": study_id}
             )
-        return self.query("SELECT * FROM sample")
+        return self.query("SELECT * FROM sample_derived")
 
     def get_existing_patients(self, study_id: Optional[str] = None) -> pd.DataFrame:
         """Get existing patients, optionally filtered by study."""
         if study_id:
-            return self.query(
-                "SELECT * FROM patient WHERE cancer_study_identifier = %(study)s", 
-                {"study": study_id}
-            )
-        return self.query("SELECT * FROM patient")
+            return self.query("""
+                SELECT DISTINCT 
+                    patient_unique_id,
+                    patient_stable_id,
+                    cancer_study_identifier,
+                    patient_internal_id
+                FROM sample_derived 
+                WHERE cancer_study_identifier = %(study)s
+            """, {"study": study_id})
+        return self.query("""
+            SELECT DISTINCT 
+                patient_unique_id,
+                patient_stable_id,
+                cancer_study_identifier,
+                patient_internal_id
+            FROM sample_derived
+        """)
 
     def get_existing_genes(self, gene_symbols: Optional[List[str]] = None) -> pd.DataFrame:
         """Get existing genes, optionally filtered by symbols."""
@@ -265,13 +277,14 @@ class CBioPortalClient:
         """Get bulk RNA-seq expression data for a gene in a study."""
         return self.query("""
         SELECT 
-            sample_unique_id,
-            patient_unique_id,
-            alteration_value
-        FROM genetic_alteration_derived 
-        WHERE cancer_study_identifier = %(study)s
-          AND hugo_gene_symbol = %(gene)s
-          AND profile_type = 'rna_seq_v2_mrna'
+            gad.sample_unique_id,
+            sd.patient_unique_id,
+            gad.alteration_value
+        FROM genetic_alteration_derived gad
+        JOIN sample_derived sd ON gad.sample_unique_id = sd.sample_unique_id
+        WHERE gad.cancer_study_identifier = %(study)s
+          AND gad.hugo_gene_symbol = %(gene)s
+          AND gad.profile_type = 'rna_seq_mrna'
         """, {"study": study_id, "gene": gene_symbol})
 
     def close(self) -> None:

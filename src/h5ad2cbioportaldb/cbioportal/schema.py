@@ -53,12 +53,17 @@ class CBioPortalSchema:
             placeholders = ",".join([f"'{sid}'" for sid in sample_ids])
             existing = self.client.query(f"""
                 SELECT sample_unique_id 
-                FROM sample 
+                FROM sample_derived 
                 WHERE cancer_study_identifier = '{study_id}' 
                   AND sample_unique_id IN ({placeholders})
             """)
             
-            existing_ids = set(existing["sample_unique_id"].tolist())
+            # Handle empty result set
+            if existing.empty or "sample_unique_id" not in existing.columns:
+                existing_ids = set()
+            else:
+                existing_ids = set(existing["sample_unique_id"].tolist())
+            
             input_ids = set(sample_ids)
             
             return {
@@ -81,13 +86,18 @@ class CBioPortalSchema:
 
             placeholders = ",".join([f"'{pid}'" for pid in patient_ids])
             existing = self.client.query(f"""
-                SELECT patient_unique_id 
-                FROM patient 
+                SELECT DISTINCT patient_unique_id 
+                FROM sample_derived 
                 WHERE cancer_study_identifier = '{study_id}' 
                   AND patient_unique_id IN ({placeholders})
             """)
             
-            existing_ids = set(existing["patient_unique_id"].tolist())
+            # Handle empty result set
+            if existing.empty or "patient_unique_id" not in existing.columns:
+                existing_ids = set()
+            else:
+                existing_ids = set(existing["patient_unique_id"].tolist())
+            
             input_ids = set(patient_ids)
             
             return {
@@ -136,14 +146,12 @@ class CBioPortalSchema:
         try:
             return self.client.query("""
                 SELECT 
-                    s.sample_unique_id,
-                    s.patient_unique_id,
-                    s.sample_type,
-                    p.patient_unique_id as patient_id_check
-                FROM sample s
-                LEFT JOIN patient p ON s.patient_unique_id = p.patient_unique_id 
-                    AND s.cancer_study_identifier = p.cancer_study_identifier
-                WHERE s.cancer_study_identifier = %(study)s
+                    sample_unique_id,
+                    patient_unique_id,
+                    sample_type,
+                    cancer_study_identifier
+                FROM sample_derived
+                WHERE cancer_study_identifier = %(study)s
             """, {"study": study_id})
         except Exception as e:
             logger.error(f"Failed to get sample-patient mapping for {study_id}: {e}")
@@ -175,6 +183,12 @@ class CBioPortalSchema:
         """Get single-cell dataset information."""
         try:
             table_name = f"{self.client.table_prefix}datasets"
+            
+            # Check if table exists first
+            if not self.check_table_exists(table_name):
+                logger.debug(f"Table {table_name} does not exist yet")
+                return None
+            
             result = self.client.query(
                 f"SELECT * FROM {self.client.database}.{table_name} WHERE dataset_id = %(dataset)s",
                 {"dataset": dataset_id}
@@ -190,6 +204,12 @@ class CBioPortalSchema:
         """List all single-cell datasets, optionally filtered by study."""
         try:
             table_name = f"{self.client.table_prefix}datasets"
+            
+            # Check if table exists first
+            if not self.check_table_exists(table_name):
+                logger.debug(f"Table {table_name} does not exist yet")
+                return pd.DataFrame()
+            
             if study_id:
                 return self.client.query(
                     f"SELECT * FROM {self.client.database}.{table_name} WHERE cancer_study_identifier = %(study)s",
