@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import anndata
+import click
 import numpy as np
 import pandas as pd
 from scipy import sparse
@@ -49,21 +50,57 @@ class H5adImporter:
         description: Optional[str] = None,
         matrix_type: str = "raw",
         dry_run: bool = False,
+        overwrite: bool = False,
     ) -> Dict[str, Any]:
         """Import h5ad file into cBioPortal database."""
         
         logger.info(f"Starting import of dataset {dataset_id} from {file}")
         
         # Validate inputs
-        self._validate_import_inputs(file, dataset_id, study_id, matrix_type)
+        self._validate_import_inputs(file, dataset_id, study_id, matrix_type, overwrite)
         
         # Load h5ad file
+        click.echo("📁 Loading h5ad file...")
         adata = self._load_h5ad_file(file)
-        logger.info(f"Loaded h5ad file: {adata.n_obs} cells, {adata.n_vars} genes")
+        click.echo(f"✅ Loaded h5ad file: {adata.n_obs:,} cells, {adata.n_vars:,} genes")
         
         # Validate study exists
         if not self.schema.validate_study_exists(study_id):
             raise ValueError(f"Study {study_id} not found in cBioPortal")
+        
+        # Use streaming approach for large datasets
+        if adata.n_obs > 50000:  # Use streaming for datasets with >50k cells
+            click.echo(f"🔄 Large dataset detected ({adata.n_obs:,} cells), using streaming import")
+            return self._streaming_import(
+                file, adata, dataset_id, study_id, cell_type_column,
+                sample_obs_column, patient_obs_column, sample_mapping_file,
+                patient_mapping_file, description, matrix_type, dry_run, overwrite
+            )
+        
+        # Original in-memory approach for smaller datasets
+        click.echo(f"⚡ Small dataset ({adata.n_obs:,} cells), using in-memory import")
+        return self._memory_import(
+            adata, dataset_id, study_id, cell_type_column,
+            sample_obs_column, patient_obs_column, sample_mapping_file,
+            patient_mapping_file, description, matrix_type, dry_run, file
+        )
+        
+    def _memory_import(
+        self,
+        adata: anndata.AnnData,
+        dataset_id: str,
+        study_id: str,
+        cell_type_column: Optional[str],
+        sample_obs_column: Optional[str],
+        patient_obs_column: Optional[str],
+        sample_mapping_file: Optional[str],
+        patient_mapping_file: Optional[str],
+        description: Optional[str],
+        matrix_type: str,
+        dry_run: bool,
+        file: str,
+    ) -> Dict[str, Any]:
+        """Original in-memory import for smaller datasets."""
         
         # Resolve sample/patient mappings
         resolved_mappings, mapping_stats = self.mapper.resolve_mappings(
@@ -110,8 +147,96 @@ class H5adImporter:
         # Generate final summary
         return self._generate_import_summary(dataset_id, adata, mapping_stats)
 
+    def _streaming_import(
+        self,
+        file: str,
+        adata: anndata.AnnData,
+        dataset_id: str,
+        study_id: str,
+        cell_type_column: Optional[str],
+        sample_obs_column: Optional[str],
+        patient_obs_column: Optional[str],
+        sample_mapping_file: Optional[str],
+        patient_mapping_file: Optional[str],
+        description: Optional[str],
+        matrix_type: str,
+        dry_run: bool,
+        overwrite: bool,
+    ) -> Dict[str, Any]:
+        """Streaming import for large datasets to minimize memory usage."""
+        
+        # First pass: analyze metadata and mappings using backed mode
+        click.echo("🔍 Pass 1: Analyzing metadata and mappings...")
+        
+        # Close current adata and reopen in backed mode
+        adata_backed = anndata.read_h5ad(file, backed='r')
+        obs_df = adata_backed.obs.copy()  # Copy metadata only
+        var_df = adata_backed.var.copy()  # Copy gene metadata only
+        
+        # Resolve mappings using metadata only
+        click.echo("📋 Resolving sample/patient mappings...")
+        with click.progressbar(length=len(obs_df), label="Analyzing cells") as bar:
+            resolved_mappings, mapping_stats = self.mapper.resolve_mappings(
+                adata_backed, study_id, sample_obs_column, patient_obs_column,
+                sample_mapping_file, patient_mapping_file
+            )
+            bar.update(len(obs_df))
+        
+        # Map genes using var metadata
+        click.echo("🧬 Mapping genes to cBioPortal...")
+        gene_mapping = self._map_genes_to_cbioportal_from_var(var_df, dataset_id)
+        
+        # Validate mappings if requested
+        if self.validate_mappings and not dry_run:
+            self._validate_before_import(study_id, resolved_mappings, gene_mapping)
+        
+        # Prepare dataset record
+        dataset_record = self._prepare_dataset_record(
+            adata_backed, dataset_id, study_id, file, description, mapping_stats
+        )
+        
+        adata_backed.file.close()  # Close backed file
+        
+        if dry_run:
+            return {
+                "dataset_id": dataset_id,
+                "study_id": study_id,
+                "n_cells": len(obs_df),
+                "n_genes": len(var_df),
+                "mapping_statistics": mapping_stats,
+                "dry_run": True,
+            }
+        
+        # Create tables if they don't exist
+        self.client.create_tables_if_not_exist()
+        
+        # Insert dataset record
+        click.echo("📝 Creating dataset record...")
+        self.integration.insert_dataset(dataset_record)
+        
+        # Insert gene records
+        gene_records = self._prepare_gene_records(dataset_id, gene_mapping)
+        click.echo(f"🧬 Inserting {len(gene_records):,} gene records...")
+        self.integration.insert_genes(gene_records)
+        
+        # Stream cell and expression data in batches
+        click.echo("💾 Importing cell and expression data...")
+        self._stream_cell_and_expression_data_optimized(
+            file, dataset_id, obs_df, resolved_mappings, 
+            cell_type_column, matrix_type, gene_mapping
+        )
+        
+        # Generate final summary
+        return {
+            "dataset_id": dataset_id,
+            "n_cells": len(obs_df),
+            "n_genes": len(var_df),
+            "mapping_statistics": mapping_stats,
+            "success": True,
+        }
+
     def _validate_import_inputs(
-        self, file: str, dataset_id: str, study_id: str, matrix_type: str
+        self, file: str, dataset_id: str, study_id: str, matrix_type: str, overwrite: bool = False
     ) -> None:
         """Validate import inputs."""
         if not Path(file).exists():
@@ -125,8 +250,11 @@ class H5adImporter:
         
         # Check if dataset already exists
         existing_dataset = self.schema.get_dataset_info(dataset_id)
-        if existing_dataset:
-            raise ValueError(f"Dataset {dataset_id} already exists")
+        if existing_dataset and not overwrite:
+            raise ValueError(f"Dataset {dataset_id} already exists. Use --overwrite to replace it.")
+        elif existing_dataset and overwrite:
+            logger.info(f"Overwriting existing dataset {dataset_id}")
+            self._cleanup_existing_dataset(dataset_id)
 
     def _load_h5ad_file(self, file: str) -> anndata.AnnData:
         """Load and validate h5ad file."""
@@ -146,12 +274,56 @@ class H5adImporter:
             logger.error(f"Failed to load h5ad file {file}: {e}")
             raise
 
+    def _cleanup_existing_dataset(self, dataset_id: str) -> None:
+        """Remove existing dataset data."""
+        tables_to_clean = [
+            f"{self.client.table_prefix}datasets",
+            f"{self.client.table_prefix}cells", 
+            f"{self.client.table_prefix}dataset_genes",
+            f"{self.client.table_prefix}expression_matrix",
+            f"{self.client.table_prefix}cell_embeddings"
+        ]
+        
+        for table in tables_to_clean:
+            try:
+                self.client.command(f"""
+                DELETE FROM {self.client.database}.{table} 
+                WHERE dataset_id = %(dataset)s
+                """, {"dataset": dataset_id})
+                logger.debug(f"Cleaned {table}")
+            except Exception as e:
+                logger.warning(f"Could not clean {table}: {e}")
+
     def _map_genes_to_cbioportal(self, adata: anndata.AnnData, dataset_id: str) -> Dict[str, Any]:
         """Map genes from h5ad to cBioPortal gene table."""
-        gene_symbols = adata.var.index.tolist()
         
-        # Get existing genes from cBioPortal
-        existing_genes_df = self.client.get_existing_genes(gene_symbols)
+        # Extract gene symbols - handle different formats
+        if 'feature_name' in adata.var.columns:
+            # Parse Hugo symbols from feature_name column
+            gene_symbols = []
+            original_names = adata.var['feature_name'].tolist()
+            
+            for name in original_names:
+                if '_ENSG' in name:
+                    # Extract Hugo symbol before _ENSG (format: hugoname_ENSGxxxxx)
+                    hugo_symbol = name.split('_ENSG')[0]
+                    gene_symbols.append(hugo_symbol)
+                elif name.startswith('ENSG'):
+                    # Pure ENSEMBL ID - skip for now as we need Hugo symbols
+                    gene_symbols.append(None)
+                else:
+                    # Use as-is if already a gene symbol
+                    gene_symbols.append(name)
+                    
+            logger.info(f"Parsed Hugo symbols from feature_name column: {len([g for g in gene_symbols if g])} valid genes")
+        else:
+            # Fallback to index
+            gene_symbols = adata.var.index.tolist()
+            logger.info(f"Using gene symbols from var index: {len(gene_symbols)} genes")
+        
+        # Get existing genes from cBioPortal (filter out None values)
+        valid_gene_symbols = [g for g in gene_symbols if g is not None]
+        existing_genes_df = self.client.get_existing_genes(valid_gene_symbols)
         existing_genes = {
             row["hugo_gene_symbol"]: {
                 "entrez_gene_id": row["entrez_gene_id"],
@@ -165,13 +337,13 @@ class H5adImporter:
         unmapped_genes = []
         
         for idx, gene_symbol in enumerate(gene_symbols):
-            if gene_symbol in existing_genes:
+            if gene_symbol and gene_symbol in existing_genes:
                 mapped_genes.append({
                     "idx": idx,
                     "symbol": gene_symbol,
                     "entrez_id": existing_genes[gene_symbol]["entrez_gene_id"]
                 })
-            else:
+            elif gene_symbol:
                 unmapped_genes.append(gene_symbol)
         
         logger.info(f"Gene mapping: {len(mapped_genes)} mapped, {len(unmapped_genes)} unmapped")
@@ -515,3 +687,324 @@ class H5adImporter:
         adata = anndata.AnnData(X=X, obs=obs, var=var)
         
         return adata
+
+    def _map_genes_to_cbioportal_from_var(self, var_df: pd.DataFrame, dataset_id: str) -> Dict[str, Any]:
+        """Map genes from var DataFrame to cBioPortal gene table."""
+        
+        # Extract gene symbols - handle different formats
+        if 'feature_name' in var_df.columns:
+            # Parse Hugo symbols from feature_name column
+            gene_symbols = []
+            original_names = var_df['feature_name'].tolist()
+            
+            for name in original_names:
+                if '_ENSG' in name:
+                    # Extract Hugo symbol before _ENSG (format: hugoname_ENSGxxxxx)
+                    hugo_symbol = name.split('_ENSG')[0]
+                    gene_symbols.append(hugo_symbol)
+                elif name.startswith('ENSG'):
+                    # Pure ENSEMBL ID - skip for now as we need Hugo symbols
+                    gene_symbols.append(None)
+                else:
+                    # Use as-is if already a gene symbol
+                    gene_symbols.append(name)
+                    
+            logger.info(f"Parsed Hugo symbols from feature_name column: {len([g for g in gene_symbols if g])} valid genes")
+        else:
+            # Fallback to index
+            gene_symbols = var_df.index.tolist()
+            logger.info(f"Using gene symbols from var index: {len(gene_symbols)} genes")
+        
+        # Get existing genes from cBioPortal (filter out None values)
+        valid_gene_symbols = [g for g in gene_symbols if g is not None]
+        existing_genes_df = self.client.get_existing_genes(valid_gene_symbols)
+        existing_genes = {
+            row["hugo_gene_symbol"]: {
+                "entrez_gene_id": row["entrez_gene_id"],
+                "gene_symbol": row["hugo_gene_symbol"]
+            }
+            for _, row in existing_genes_df.iterrows()
+        }
+        
+        # Create mapping
+        mapped_genes = []
+        unmapped_genes = []
+        
+        for idx, gene_symbol in enumerate(gene_symbols):
+            if gene_symbol and gene_symbol in existing_genes:
+                mapped_genes.append({
+                    "idx": idx,
+                    "symbol": gene_symbol,
+                    "entrez_id": existing_genes[gene_symbol]["entrez_gene_id"]
+                })
+            elif gene_symbol:
+                unmapped_genes.append(gene_symbol)
+        
+        logger.info(f"Gene mapping: {len(mapped_genes)} mapped, {len(unmapped_genes)} unmapped")
+        
+        if unmapped_genes and self.config.get("warn_unmapped_genes", True):
+            logger.warning(f"Unmapped genes ({len(unmapped_genes)}): {unmapped_genes[:10]}...")
+        
+        return {
+            "mapped": mapped_genes,
+            "unmapped": unmapped_genes,
+            "total": len(gene_symbols)
+        }
+
+    def _stream_cell_and_expression_data(
+        self,
+        file: str,
+        dataset_id: str,
+        obs_df: pd.DataFrame,
+        resolved_mappings: Dict[str, Any],
+        cell_type_column: Optional[str],
+        matrix_type: str,
+        gene_mapping: Dict[str, Any],
+    ) -> None:
+        """Stream cell and expression data in batches to minimize memory usage."""
+        
+        logger.info("Pass 2: Streaming cell and expression data in batches...")
+        
+        # Get valid gene indices
+        valid_gene_indices = [g["idx"] for g in gene_mapping["mapped"]]
+        
+        # Process in batches
+        batch_size = self.batch_size
+        total_cells = len(obs_df)
+        
+        for batch_start in range(0, total_cells, batch_size):
+            batch_end = min(batch_start + batch_size, total_cells)
+            batch_cells = obs_df.iloc[batch_start:batch_end]
+            
+            logger.info(f"Processing batch {batch_start//batch_size + 1}: cells {batch_start}-{batch_end}")
+            
+            # Prepare cell records for this batch
+            cell_records = []
+            for idx, (cell_id, row) in enumerate(batch_cells.iterrows()):
+                mapping_info = resolved_mappings.get(str(cell_id), {})
+                
+                record = {
+                    "dataset_id": dataset_id,
+                    "cell_id": str(cell_id),
+                    "cell_barcode": row.get("barcode", str(cell_id)),
+                    "sample_unique_id": mapping_info.get("sample_id"),
+                    "patient_unique_id": mapping_info.get("patient_id"),
+                    "original_cell_type": row.get(cell_type_column, "Unknown") if cell_type_column else "Unknown",
+                    "harmonized_cell_type_id": None,
+                    "harmonization_confidence": None,
+                    "mapping_strategy": mapping_info.get("strategy", "no_mapping"),
+                    "obs_data": json.dumps(row.to_dict()),
+                }
+                cell_records.append(record)
+            
+            # Insert cell records
+            self.integration.insert_cells(cell_records)
+            
+            # Process expression data for this batch
+            self._stream_expression_batch(
+                file, dataset_id, batch_start, batch_end, 
+                valid_gene_indices, matrix_type, cell_records
+            )
+            
+            logger.info(f"Completed batch {batch_start//batch_size + 1}")
+        
+        logger.info("Streaming import completed")
+
+    def _stream_expression_batch(
+        self,
+        file: str,
+        dataset_id: str,
+        batch_start: int,
+        batch_end: int,
+        valid_gene_indices: List[int],
+        matrix_type: str,
+        cell_records: List[Dict[str, Any]],
+    ) -> None:
+        """Stream expression data for a batch of cells."""
+        
+        # Read expression data for this batch only
+        adata_batch = anndata.read_h5ad(file, backed='r')
+        
+        # Select appropriate matrix
+        if matrix_type == "raw" and adata_batch.raw is not None:
+            X_batch = adata_batch.raw.X[batch_start:batch_end, :]
+        elif matrix_type == "normalized" and "normalized" in adata_batch.layers:
+            X_batch = adata_batch.layers["normalized"][batch_start:batch_end, :]
+        elif matrix_type == "scaled" and "scaled" in adata_batch.layers:
+            X_batch = adata_batch.layers["scaled"][batch_start:batch_end, :]
+        else:
+            X_batch = adata_batch.X[batch_start:batch_end, :]
+        
+        # Convert to sparse if needed
+        if not sparse.issparse(X_batch):
+            X_batch = sparse.csr_matrix(X_batch)
+        
+        # Filter to valid genes only
+        X_batch = X_batch[:, valid_gene_indices]
+        
+        # Prepare expression records
+        expression_records = []
+        cell_ids = [record["cell_id"] for record in cell_records]
+        
+        # Convert sparse matrix to records
+        X_coo = X_batch.tocoo()
+        for i, j, value in zip(X_coo.row, X_coo.col, X_coo.data):
+            if value != 0:  # Skip zero values for SPARSE columns
+                expression_records.append([
+                    dataset_id,
+                    cell_ids[i],
+                    valid_gene_indices[j],
+                    matrix_type,
+                    float(value)
+                ])
+        
+        # Insert expression data
+        if expression_records:
+            columns = ["dataset_id", "cell_id", "gene_idx", "matrix_type", "count"]
+            self.client.bulk_insert(
+                f"{self.client.table_prefix}expression_matrix",
+                expression_records,
+                columns,
+                batch_size=self.batch_size
+            )
+        
+        adata_batch.file.close()
+
+    def _stream_cell_and_expression_data_optimized(
+        self,
+        file: str,
+        dataset_id: str,
+        obs_df: pd.DataFrame,
+        resolved_mappings: Dict[str, Any],
+        cell_type_column: Optional[str],
+        matrix_type: str,
+        gene_mapping: Dict[str, Any],
+    ) -> None:
+        """Optimized streaming with persistent file handle."""
+        
+        # Get valid gene indices
+        valid_gene_indices = [g["idx"] for g in gene_mapping["mapped"]]
+        logger.info(f"Processing {len(valid_gene_indices)} mapped genes")
+        
+        # Open file once and keep handle
+        logger.info("Opening h5ad file for streaming...")
+        adata_stream = anndata.read_h5ad(file, backed='r')
+        
+        try:
+            # Process in batches
+            batch_size = self.batch_size
+            total_cells = len(obs_df)
+            total_batches = (total_cells + batch_size - 1) // batch_size
+            
+            logger.info(f"Processing {total_cells} cells in {total_batches} batches of {batch_size}")
+            
+            with click.progressbar(length=total_batches, label="Processing batches") as bar:
+                for batch_num, batch_start in enumerate(range(0, total_cells, batch_size), 1):
+                    batch_end = min(batch_start + batch_size, total_cells)
+                    batch_cells = obs_df.iloc[batch_start:batch_end]
+                    
+                    logger.debug(f"Batch {batch_num}/{total_batches}: cells {batch_start}-{batch_end-1}")
+                    
+                    # Prepare cell records for this batch
+                    cell_records = []
+                    for cell_id, row in batch_cells.iterrows():
+                        mapping_info = resolved_mappings.get(str(cell_id), {})
+                        
+                        record = {
+                            "dataset_id": dataset_id,
+                            "cell_id": str(cell_id),
+                            "cell_barcode": row.get("barcode", str(cell_id)),
+                            "sample_unique_id": mapping_info.get("sample_id"),
+                            "patient_unique_id": mapping_info.get("patient_id"),
+                            "original_cell_type": row.get(cell_type_column, "Unknown") if cell_type_column else "Unknown",
+                            "harmonized_cell_type_id": None,
+                            "harmonization_confidence": None,
+                            "mapping_strategy": mapping_info.get("strategy", "no_mapping"),
+                            "obs_data": json.dumps(row.to_dict()),
+                        }
+                        cell_records.append(record)
+                    
+                    # Insert cell records
+                    logger.debug(f"Inserting {len(cell_records)} cell records")
+                    self.integration.insert_cells(cell_records)
+                    
+                    # Process expression data for this batch with persistent handle
+                    logger.debug(f"Processing expression data for batch {batch_num}")
+                    self._stream_expression_batch_optimized(
+                        adata_stream, dataset_id, batch_start, batch_end, 
+                        valid_gene_indices, matrix_type, cell_records
+                    )
+                    
+                    bar.update(1)
+            
+        finally:
+            # Always close file handle
+            adata_stream.file.close()
+            click.echo("✅ Streaming import completed")
+
+    def _stream_expression_batch_optimized(
+        self,
+        adata_stream: anndata.AnnData,
+        dataset_id: str,
+        batch_start: int,
+        batch_end: int,
+        valid_gene_indices: List[int],
+        matrix_type: str,
+        cell_records: List[Dict[str, Any]],
+    ) -> None:
+        """Optimized expression streaming with persistent file handle."""
+        
+        # Select appropriate matrix without reopening file
+        logger.debug(f"Reading expression matrix slice [{batch_start}:{batch_end}, :]")
+        
+        if matrix_type == "raw" and adata_stream.raw is not None:
+            X_batch = adata_stream.raw.X[batch_start:batch_end, :]
+        elif matrix_type == "normalized" and "normalized" in adata_stream.layers:
+            X_batch = adata_stream.layers["normalized"][batch_start:batch_end, :]
+        elif matrix_type == "scaled" and "scaled" in adata_stream.layers:
+            X_batch = adata_stream.layers["scaled"][batch_start:batch_end, :]
+        else:
+            X_batch = adata_stream.X[batch_start:batch_end, :]
+        
+        logger.debug(f"Matrix slice shape: {X_batch.shape}, sparse: {sparse.issparse(X_batch)}")
+        
+        # Convert to sparse if needed
+        if not sparse.issparse(X_batch):
+            X_batch = sparse.csr_matrix(X_batch)
+        
+        # Filter to valid genes only
+        X_batch = X_batch[:, valid_gene_indices]
+        logger.debug(f"Filtered to {len(valid_gene_indices)} valid genes, new shape: {X_batch.shape}")
+        
+        # Convert to COO format for efficient iteration
+        X_coo = X_batch.tocoo()
+        nnz = X_coo.nnz
+        logger.debug(f"Non-zero values: {nnz}")
+        
+        # Prepare expression records
+        expression_records = []
+        cell_ids = [record["cell_id"] for record in cell_records]
+        
+        # Convert sparse matrix to records
+        for i, j, value in zip(X_coo.row, X_coo.col, X_coo.data):
+            if value != 0:  # Extra safety check for zero values
+                expression_records.append([
+                    dataset_id,
+                    cell_ids[i],
+                    valid_gene_indices[j],
+                    matrix_type,
+                    float(value)
+                ])
+        
+        # Insert expression data
+        if expression_records:
+            logger.debug(f"Inserting {len(expression_records)} expression values")
+            columns = ["dataset_id", "cell_id", "gene_idx", "matrix_type", "count"]
+            self.client.bulk_insert(
+                f"{self.client.table_prefix}expression_matrix",
+                expression_records,
+                columns,
+                batch_size=self.batch_size
+            )
+        else:
+            logger.debug("No expression values to insert for this batch")
