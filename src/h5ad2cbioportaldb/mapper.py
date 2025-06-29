@@ -26,7 +26,7 @@ class CBioPortalMapper:
         
         # Mapping configuration
         self.strategy = config.get("strategy", "flexible")
-        self.create_synthetic_samples = config.get("create_synthetic_samples", True)
+        self.create_synthetic_samples = config.get("create_synthetic_samples", False)  # Changed default to False
         self.synthetic_sample_suffix = config.get("synthetic_sample_suffix", "SC")
         self.allow_unmapped_cells = config.get("allow_unmapped_cells", True)
         self.require_patient_mapping = config.get("require_patient_mapping", False)
@@ -110,6 +110,12 @@ class CBioPortalMapper:
         
         # Log mapping statistics
         self._log_mapping_statistics(strategies, len(adata.obs), len(synthetic_samples_created))
+        
+        # Optionally create synthetic samples for patient-only matches
+        if self.config.get("create_synthetic_samples_for_patients", False):
+            resolved_mappings = self._create_synthetic_samples_for_patients(
+                resolved_mappings, strategies
+            )
         
         return resolved_mappings, strategies
 
@@ -235,25 +241,13 @@ class CBioPortalMapper:
         if mapped_sample_id and mapped_sample_id in existing_samples:
             return "direct_sample_match", mapped_sample_id, existing_samples[mapped_sample_id]
         
-        # Try patient match with synthetic sample
+        # Try patient match
         if mapped_patient_id and mapped_patient_id in existing_patients:
-            if self.create_synthetic_samples:
-                synthetic_sample_id = self.schema.generate_synthetic_sample_id(
-                    mapped_patient_id, self.synthetic_sample_suffix
-                )
-                return "synthetic_sample_created", synthetic_sample_id, mapped_patient_id
-            else:
-                return "patient_only_match", None, mapped_patient_id
+            return "patient_only_match", None, mapped_patient_id
         
         # Try direct patient ID match (no mapping file)
         if h5ad_patient_id and h5ad_patient_id in existing_patients:
-            if self.create_synthetic_samples:
-                synthetic_sample_id = self.schema.generate_synthetic_sample_id(
-                    h5ad_patient_id, self.synthetic_sample_suffix
-                )
-                return "synthetic_sample_created", synthetic_sample_id, h5ad_patient_id
-            else:
-                return "patient_only_match", None, h5ad_patient_id
+            return "patient_only_match", None, h5ad_patient_id
         
         return "no_mapping", None, None
 
@@ -340,25 +334,13 @@ class CBioPortalMapper:
             if mapped_patient_id:
                 logger.info(f"DEBUG Cell {self._debug_count}: available patient keys: {list(existing_patients.keys())[:5]}...")
         
-        # Strategy 2: Patient-only match (with synthetic sample creation)
+        # Strategy 2: Patient-only match (mapped patient ID)
         if mapped_patient_id and mapped_patient_id in existing_patients:
-            if self.create_synthetic_samples:
-                synthetic_sample_id = self.schema.generate_synthetic_sample_id(
-                    mapped_patient_id, self.synthetic_sample_suffix
-                )
-                return "synthetic_sample_created", synthetic_sample_id, mapped_patient_id
-            else:
-                return "patient_only_match", None, mapped_patient_id
+            return "patient_only_match", None, mapped_patient_id
         
-        # Strategy 2b: Check if h5ad_patient_id directly exists (no mapping file case)
+        # Strategy 2b: Direct patient ID match (no mapping file case)
         if h5ad_patient_id and h5ad_patient_id in existing_patients:
-            if self.create_synthetic_samples:
-                synthetic_sample_id = self.schema.generate_synthetic_sample_id(
-                    h5ad_patient_id, self.synthetic_sample_suffix
-                )
-                return "synthetic_sample_created", synthetic_sample_id, h5ad_patient_id
-            else:
-                return "patient_only_match", None, h5ad_patient_id
+            return "patient_only_match", None, h5ad_patient_id
         
         # Strategy 3: No mapping (if allowed)
         if self.allow_unmapped_cells:
@@ -623,6 +605,46 @@ class CBioPortalMapper:
         
         files_created.append(str(config_file))
         logger.info(f"Created dataset configuration: {config_file}")
+
+    def _create_synthetic_samples_for_patients(
+        self,
+        resolved_mappings: Dict[str, Dict[str, Any]],
+        strategies: Dict[str, int],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Convert patient_only_match entries to synthetic_sample_created if configured."""
+        
+        logger.info("Creating synthetic samples for patient-only matches...")
+        
+        synthetic_samples_created = set()
+        updated_mappings = {}
+        
+        for cell_id, mapping in resolved_mappings.items():
+            if mapping["strategy"] == "patient_only_match" and mapping["patient_id"]:
+                # Create synthetic sample ID
+                synthetic_sample_id = self.schema.generate_synthetic_sample_id(
+                    mapping["patient_id"], self.synthetic_sample_suffix
+                )
+                
+                # Update mapping
+                updated_mappings[cell_id] = {
+                    "strategy": "synthetic_sample_created",
+                    "sample_id": synthetic_sample_id,
+                    "patient_id": mapping["patient_id"],
+                }
+                
+                synthetic_samples_created.add(synthetic_sample_id)
+            else:
+                # Keep original mapping
+                updated_mappings[cell_id] = mapping
+        
+        # Update strategy counts
+        patient_only_count = strategies["patient_only_match"]
+        strategies["patient_only_match"] = 0
+        strategies["synthetic_sample_created"] = patient_only_count
+        
+        logger.info(f"Created {len(synthetic_samples_created)} unique synthetic samples")
+        
+        return updated_mappings
 
     def validate_mappings(
         self,

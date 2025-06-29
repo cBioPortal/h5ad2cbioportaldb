@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Union
 import clickhouse_connect
 import pandas as pd
 from clickhouse_connect.driver import Client
+from tqdm import tqdm
 
 
 logger = logging.getLogger(__name__)
@@ -81,17 +82,28 @@ class CBioPortalClient:
         table: str,
         df: pd.DataFrame,
         batch_size: int = 10000,
+        desc: Optional[str] = None,
     ) -> None:
-        """Insert DataFrame into table in batches."""
+        """Insert DataFrame into table in batches with progress tracking."""
         try:
             full_table_name = f"{self.database}.{table}"
+            total_batches = (len(df) + batch_size - 1) // batch_size
             
-            for i in range(0, len(df), batch_size):
-                batch = df.iloc[i:i + batch_size]
-                self.client.insert_df(full_table_name, batch)
-                logger.debug(f"Inserted batch {i//batch_size + 1}: {len(batch)} rows")
+            # Create progress bar
+            progress_desc = desc or f"Inserting into {table}"
+            
+            with tqdm(total=total_batches, desc=progress_desc, unit="batch") as pbar:
+                for i in range(0, len(df), batch_size):
+                    batch = df.iloc[i:i + batch_size]
+                    self.client.insert_df(full_table_name, batch)
+                    
+                    pbar.update(1)
+                    pbar.set_postfix({
+                        'rows': f"{min(i + batch_size, len(df)):,}/{len(df):,}",
+                        'batch_size': len(batch)
+                    })
                 
-            logger.info(f"Successfully inserted {len(df)} rows into {full_table_name}")
+            logger.info(f"Successfully inserted {len(df):,} rows into {full_table_name}")
             
         except Exception as e:
             logger.error(f"Insert failed for table {table}: {e}")
@@ -103,17 +115,28 @@ class CBioPortalClient:
         data: List[List[Any]],
         columns: List[str],
         batch_size: int = 10000,
+        desc: Optional[str] = None,
     ) -> None:
-        """Bulk insert data into table."""
+        """Bulk insert data into table with progress tracking."""
         try:
             full_table_name = f"{self.database}.{table}"
+            total_batches = (len(data) + batch_size - 1) // batch_size
             
-            for i in range(0, len(data), batch_size):
-                batch_data = data[i:i + batch_size]
-                self.client.insert(full_table_name, batch_data, column_names=columns)
-                logger.debug(f"Bulk inserted batch {i//batch_size + 1}: {len(batch_data)} rows")
+            # Create progress bar
+            progress_desc = desc or f"Inserting into {table}"
+            
+            with tqdm(total=total_batches, desc=progress_desc, unit="batch") as pbar:
+                for i in range(0, len(data), batch_size):
+                    batch_data = data[i:i + batch_size]
+                    self.client.insert(full_table_name, batch_data, column_names=columns)
+                    
+                    pbar.update(1)
+                    pbar.set_postfix({
+                        'rows': f"{min(i + batch_size, len(data)):,}/{len(data):,}",
+                        'batch_size': len(batch_data)
+                    })
                 
-            logger.info(f"Successfully bulk inserted {len(data)} rows into {full_table_name}")
+            logger.info(f"Successfully bulk inserted {len(data):,} rows into {full_table_name}")
             
         except Exception as e:
             logger.error(f"Bulk insert failed for table {table}: {e}")
@@ -221,14 +244,14 @@ class CBioPortalClient:
         """
 
     def _get_expression_table_ddl(self) -> str:
-        """Get DDL for scRNA_expression_matrix table with SPARSE columns."""
+        """Get DDL for scRNA_expression_matrix table with compression optimization."""
         return f"""
         CREATE TABLE IF NOT EXISTS {self.database}.{self.table_prefix}expression_matrix (
             dataset_id String,
             cell_id String,
             gene_idx UInt32,
             matrix_type String,
-            count Float32 SPARSE
+            count Float32 CODEC(DoubleDelta, LZ4)
         ) ENGINE = SharedMergeTree() ORDER BY (dataset_id, cell_id, gene_idx, matrix_type)
         """
 

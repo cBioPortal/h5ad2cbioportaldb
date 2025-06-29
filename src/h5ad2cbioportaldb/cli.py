@@ -152,10 +152,16 @@ def import_dataset(
         
         if dry_run:
             click.echo("✓ Validation completed successfully")
-            click.echo(f"Would import {result['n_cells']} cells, {result['n_genes']} genes")
+            if 'n_genes_total' in result:
+                click.echo(f"Would import {result['n_cells']:,} cells, {result['n_genes']:,} genes ({result['n_genes_unmapped']:,} genes skipped)")
+            else:
+                click.echo(f"Would import {result['n_cells']:,} cells, {result['n_genes']:,} genes")
         else:
             click.echo(f"✓ Successfully imported dataset {dataset_id}")
-            click.echo(f"Imported {result['n_cells']} cells, {result['n_genes']} genes")
+            if 'n_genes_total' in result:
+                click.echo(f"Imported {result['n_cells']:,} cells, {result['n_genes']:,} genes ({result['n_genes_unmapped']:,} genes skipped)")
+            else:
+                click.echo(f"Imported {result['n_cells']:,} cells, {result['n_genes']:,} genes")
             
     except Exception as e:
         click.echo(f"✗ Import failed: {e}", err=True)

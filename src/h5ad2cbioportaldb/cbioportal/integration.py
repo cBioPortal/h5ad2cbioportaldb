@@ -158,19 +158,19 @@ class CBioPortalIntegration:
         """Insert dataset record."""
         df = pd.DataFrame([dataset_record])
         table_name = f"{self.client.table_prefix}datasets"
-        self.client.insert_dataframe(table_name, df)
+        self.client.insert_dataframe(table_name, df, desc="Dataset metadata")
 
     def insert_cells(self, cell_records: List[Dict[str, Any]]) -> None:
         """Insert cell records."""
         df = pd.DataFrame(cell_records)
         table_name = f"{self.client.table_prefix}cells"
-        self.client.insert_dataframe(table_name, df)
+        self.client.insert_dataframe(table_name, df, desc="Cell metadata")
 
     def insert_genes(self, gene_records: List[Dict[str, Any]]) -> None:
         """Insert gene records."""
         df = pd.DataFrame(gene_records)
         table_name = f"{self.client.table_prefix}dataset_genes"
-        self.client.insert_dataframe(table_name, df)
+        self.client.insert_dataframe(table_name, df, desc="Gene mappings")
 
     def insert_expression_matrix(
         self,
@@ -180,7 +180,13 @@ class CBioPortalIntegration:
     ) -> None:
         """Insert expression matrix data."""
         table_name = f"{self.client.table_prefix}expression_matrix"
-        self.client.bulk_insert(table_name, expression_data, columns, batch_size)
+        self.client.bulk_insert(
+            table_name, 
+            expression_data, 
+            columns, 
+            batch_size,
+            desc="Expression matrix"
+        )
 
     def insert_embeddings(
         self,
@@ -190,7 +196,13 @@ class CBioPortalIntegration:
     ) -> None:
         """Insert embedding data."""
         table_name = f"{self.client.table_prefix}cell_embeddings"
-        self.client.bulk_insert(table_name, embedding_data, columns, batch_size)
+        self.client.bulk_insert(
+            table_name, 
+            embedding_data, 
+            columns, 
+            batch_size,
+            desc="Cell embeddings"
+        )
 
     def create_synthetic_samples(
         self,

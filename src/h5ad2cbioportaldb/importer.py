@@ -2,6 +2,8 @@
 
 import json
 import logging
+import signal
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,11 +12,67 @@ import click
 import numpy as np
 import pandas as pd
 from scipy import sparse
+from tqdm import tqdm
 
 from .cbioportal.client import CBioPortalClient
 from .cbioportal.integration import CBioPortalIntegration
 from .cbioportal.schema import CBioPortalSchema
 from .mapper import CBioPortalMapper
+
+
+logger = logging.getLogger(__name__)
+
+
+class InterruptibleImport:
+    """Context manager for handling interrupts gracefully during import."""
+    
+    def __init__(self):
+        self.interrupted = False
+        self.original_handlers = {}
+        self.cleanup_functions = []
+    
+    def __enter__(self):
+        # Set up signal handlers
+        for sig in [signal.SIGINT, signal.SIGTERM]:
+            self.original_handlers[sig] = signal.signal(sig, self._signal_handler)
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Restore original signal handlers
+        for sig, handler in self.original_handlers.items():
+            signal.signal(sig, handler)
+        
+        # Run cleanup functions
+        for cleanup_func in self.cleanup_functions:
+            try:
+                cleanup_func()
+            except Exception as e:
+                logger.warning(f"Cleanup function failed: {e}")
+    
+    def _signal_handler(self, signum, frame):
+        """Handle interrupt signals."""
+        self.interrupted = True
+        logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+        
+        # Run immediate cleanup
+        for cleanup_func in self.cleanup_functions:
+            try:
+                cleanup_func()
+            except Exception as e:
+                logger.warning(f"Cleanup function failed: {e}")
+        
+        # Exit gracefully
+        click.echo("\n🛑 Import interrupted by user")
+        sys.exit(1)
+    
+    def add_cleanup(self, func):
+        """Add a cleanup function to be called on interrupt."""
+        self.cleanup_functions.append(func)
+    
+    def check_interrupted(self):
+        """Check if we've been interrupted and raise if so."""
+        if self.interrupted:
+            raise KeyboardInterrupt("Import was interrupted")
 
 
 logger = logging.getLogger(__name__)
@@ -56,34 +114,46 @@ class H5adImporter:
         
         logger.info(f"Starting import of dataset {dataset_id} from {file}")
         
-        # Validate inputs
-        self._validate_import_inputs(file, dataset_id, study_id, matrix_type, overwrite)
-        
-        # Load h5ad file
-        click.echo("📁 Loading h5ad file...")
-        adata = self._load_h5ad_file(file)
-        click.echo(f"✅ Loaded h5ad file: {adata.n_obs:,} cells, {adata.n_vars:,} genes")
-        
-        # Validate study exists
-        if not self.schema.validate_study_exists(study_id):
-            raise ValueError(f"Study {study_id} not found in cBioPortal")
-        
-        # Use streaming approach for large datasets
-        if adata.n_obs > 50000:  # Use streaming for datasets with >50k cells
-            click.echo(f"🔄 Large dataset detected ({adata.n_obs:,} cells), using streaming import")
-            return self._streaming_import(
-                file, adata, dataset_id, study_id, cell_type_column,
+        with InterruptibleImport() as interrupt_handler:
+            # Add database connection cleanup
+            interrupt_handler.add_cleanup(lambda: self.client.close())
+            
+            # Validate inputs
+            self._validate_import_inputs(file, dataset_id, study_id, matrix_type, overwrite)
+            
+            # Check file dimensions first without loading full data
+            click.echo("📁 Checking h5ad file dimensions...")
+            n_obs, n_vars = self._get_h5ad_dimensions(file)
+            click.echo(f"✅ Found h5ad file: {n_obs:,} cells, {n_vars:,} genes")
+            
+            # Check for interrupts
+            interrupt_handler.check_interrupted()
+            
+            # Validate study exists
+            if not self.schema.validate_study_exists(study_id):
+                raise ValueError(f"Study {study_id} not found in cBioPortal")
+            
+            # Choose import strategy based on size
+            if n_obs > 50000:  # Use streaming for datasets with >50k cells
+                click.echo(f"🔄 Large dataset detected ({n_obs:,} cells), using streaming import")
+                return self._streaming_import(
+                    file, None, dataset_id, study_id, cell_type_column,
+                    sample_obs_column, patient_obs_column, sample_mapping_file,
+                    patient_mapping_file, description, matrix_type, dry_run, overwrite,
+                    interrupt_handler
+                )
+            
+            # For small datasets, load fully into memory
+            click.echo(f"⚡ Small dataset ({n_obs:,} cells), using in-memory import")
+            click.echo("📁 Loading h5ad file into memory...")
+            adata = self._load_h5ad_file(file)
+            
+            return self._memory_import(
+                adata, dataset_id, study_id, cell_type_column,
                 sample_obs_column, patient_obs_column, sample_mapping_file,
-                patient_mapping_file, description, matrix_type, dry_run, overwrite
+                patient_mapping_file, description, matrix_type, dry_run, file,
+                interrupt_handler
             )
-        
-        # Original in-memory approach for smaller datasets
-        click.echo(f"⚡ Small dataset ({adata.n_obs:,} cells), using in-memory import")
-        return self._memory_import(
-            adata, dataset_id, study_id, cell_type_column,
-            sample_obs_column, patient_obs_column, sample_mapping_file,
-            patient_mapping_file, description, matrix_type, dry_run, file
-        )
         
     def _memory_import(
         self,
@@ -99,6 +169,7 @@ class H5adImporter:
         matrix_type: str,
         dry_run: bool,
         file: str,
+        interrupt_handler: InterruptibleImport,
     ) -> Dict[str, Any]:
         """Original in-memory import for smaller datasets."""
         
@@ -145,12 +216,12 @@ class H5adImporter:
         )
         
         # Generate final summary
-        return self._generate_import_summary(dataset_id, adata, mapping_stats)
+        return self._generate_import_summary(dataset_id, adata, mapping_stats, gene_mapping)
 
     def _streaming_import(
         self,
         file: str,
-        adata: anndata.AnnData,
+        adata: Optional[anndata.AnnData],  # Now optional since we don't pre-load for large datasets
         dataset_id: str,
         study_id: str,
         cell_type_column: Optional[str],
@@ -162,25 +233,32 @@ class H5adImporter:
         matrix_type: str,
         dry_run: bool,
         overwrite: bool,
+        interrupt_handler: InterruptibleImport,
     ) -> Dict[str, Any]:
         """Streaming import for large datasets to minimize memory usage."""
         
         # First pass: analyze metadata and mappings using backed mode
         click.echo("🔍 Pass 1: Analyzing metadata and mappings...")
         
-        # Close current adata and reopen in backed mode
+        # Open in backed mode for metadata analysis
         adata_backed = anndata.read_h5ad(file, backed='r')
+        # Add file handle cleanup
+        interrupt_handler.add_cleanup(lambda: adata_backed.file.close() if hasattr(adata_backed, 'file') and adata_backed.file else None)
+        
         obs_df = adata_backed.obs.copy()  # Copy metadata only
         var_df = adata_backed.var.copy()  # Copy gene metadata only
         
         # Resolve mappings using metadata only
         click.echo("📋 Resolving sample/patient mappings...")
-        with click.progressbar(length=len(obs_df), label="Analyzing cells") as bar:
-            resolved_mappings, mapping_stats = self.mapper.resolve_mappings(
-                adata_backed, study_id, sample_obs_column, patient_obs_column,
-                sample_mapping_file, patient_mapping_file
-            )
-            bar.update(len(obs_df))
+        interrupt_handler.check_interrupted()
+        
+        # Use a simpler progress approach that doesn't block signals
+        resolved_mappings, mapping_stats = self.mapper.resolve_mappings(
+            adata_backed, study_id, sample_obs_column, patient_obs_column,
+            sample_mapping_file, patient_mapping_file
+        )
+        
+        interrupt_handler.check_interrupted()
         
         # Map genes using var metadata
         click.echo("🧬 Mapping genes to cBioPortal...")
@@ -202,7 +280,9 @@ class H5adImporter:
                 "dataset_id": dataset_id,
                 "study_id": study_id,
                 "n_cells": len(obs_df),
-                "n_genes": len(var_df),
+                "n_genes": len(gene_mapping["mapped"]),  # Use mapped genes, not total genes
+                "n_genes_total": len(var_df),
+                "n_genes_unmapped": len(gene_mapping["unmapped"]),
                 "mapping_statistics": mapping_stats,
                 "dry_run": True,
             }
@@ -223,14 +303,16 @@ class H5adImporter:
         click.echo("💾 Importing cell and expression data...")
         self._stream_cell_and_expression_data_optimized(
             file, dataset_id, obs_df, resolved_mappings, 
-            cell_type_column, matrix_type, gene_mapping
+            cell_type_column, matrix_type, gene_mapping, interrupt_handler
         )
         
         # Generate final summary
         return {
             "dataset_id": dataset_id,
             "n_cells": len(obs_df),
-            "n_genes": len(var_df),
+            "n_genes": len(gene_mapping["mapped"]),  # Use mapped genes, not total genes
+            "n_genes_total": len(var_df),
+            "n_genes_unmapped": len(gene_mapping["unmapped"]),
             "mapping_statistics": mapping_stats,
             "success": True,
         }
@@ -272,6 +354,22 @@ class H5adImporter:
             
         except Exception as e:
             logger.error(f"Failed to load h5ad file {file}: {e}")
+            raise
+
+    def _get_h5ad_dimensions(self, file: str) -> Tuple[int, int]:
+        """Quickly get h5ad file dimensions without loading full data."""
+        try:
+            # Use backed mode to read only metadata
+            adata_backed = anndata.read_h5ad(file, backed='r')
+            n_obs = adata_backed.n_obs
+            n_vars = adata_backed.n_vars
+            adata_backed.file.close()  # Close immediately
+            
+            logger.debug(f"Fast dimension check: {n_obs} cells, {n_vars} genes")
+            return n_obs, n_vars
+            
+        except Exception as e:
+            logger.error(f"Failed to get h5ad dimensions from {file}: {e}")
             raise
 
     def _cleanup_existing_dataset(self, dataset_id: str) -> None:
@@ -344,12 +442,24 @@ class H5adImporter:
                     "entrez_id": existing_genes[gene_symbol]["entrez_gene_id"]
                 })
             elif gene_symbol:
-                unmapped_genes.append(gene_symbol)
+                # Include unmapped genes with null entrez_id if configured
+                if self.config.get("include_unmapped_genes", False):
+                    mapped_genes.append({
+                        "idx": idx,
+                        "symbol": gene_symbol,
+                        "entrez_id": None
+                    })
+                else:
+                    unmapped_genes.append(gene_symbol)
         
-        logger.info(f"Gene mapping: {len(mapped_genes)} mapped, {len(unmapped_genes)} unmapped")
+        logger.info(f"Gene mapping: {len(mapped_genes)}/{len(gene_symbols)} genes mapped to cBioPortal")
         
-        if unmapped_genes and self.config.get("warn_unmapped_genes", True):
-            logger.warning(f"Unmapped genes ({len(unmapped_genes)}): {unmapped_genes[:10]}...")
+        if self.config.get("include_unmapped_genes", False):
+            logger.info(f"Including {len(unmapped_genes)} unmapped genes with null Entrez IDs")
+        elif unmapped_genes:
+            if self.config.get("warn_unmapped_genes", True):
+                logger.warning(f"Skipping {len(unmapped_genes)} unmapped genes: {unmapped_genes[:10]}...")
+            logger.info(f"Will import expression data for {len(mapped_genes)} genes only")
         
         return {
             "mapped": mapped_genes,
@@ -554,7 +664,7 @@ class H5adImporter:
             "dataset_id": dataset_record["dataset_id"],
             "study_id": dataset_record["cancer_study_identifier"],
             "n_cells": len(cell_records),
-            "n_genes": len(gene_records),
+            "n_genes": len(gene_records),  # This is already the mapped gene count
             "n_expression_values": len(expr_data),
             "n_embedding_values": len(embedding_data[0]) if embedding_data else 0,
             "dry_run": True,
@@ -563,13 +673,26 @@ class H5adImporter:
         return summary
 
     def _generate_import_summary(
-        self, dataset_id: str, adata: anndata.AnnData, mapping_stats: Dict[str, int]
+        self, dataset_id: str, adata: anndata.AnnData, mapping_stats: Dict[str, int], gene_mapping: Dict[str, Any] = None
     ) -> Dict[str, Any]:
         """Generate final import summary."""
+        if gene_mapping:
+            # Use gene mapping info if available
+            n_genes = len(gene_mapping["mapped"])
+            n_genes_total = gene_mapping["total"]
+            n_genes_unmapped = len(gene_mapping["unmapped"])
+        else:
+            # Fallback to original gene count
+            n_genes = adata.n_vars
+            n_genes_total = adata.n_vars
+            n_genes_unmapped = 0
+            
         return {
             "dataset_id": dataset_id,
             "n_cells": adata.n_obs,
-            "n_genes": adata.n_vars,
+            "n_genes": n_genes,
+            "n_genes_total": n_genes_total,
+            "n_genes_unmapped": n_genes_unmapped,
             "mapping_statistics": mapping_stats,
             "success": True,
         }
@@ -738,12 +861,24 @@ class H5adImporter:
                     "entrez_id": existing_genes[gene_symbol]["entrez_gene_id"]
                 })
             elif gene_symbol:
-                unmapped_genes.append(gene_symbol)
+                # Include unmapped genes with null entrez_id if configured
+                if self.config.get("include_unmapped_genes", False):
+                    mapped_genes.append({
+                        "idx": idx,
+                        "symbol": gene_symbol,
+                        "entrez_id": None
+                    })
+                else:
+                    unmapped_genes.append(gene_symbol)
         
-        logger.info(f"Gene mapping: {len(mapped_genes)} mapped, {len(unmapped_genes)} unmapped")
+        logger.info(f"Gene mapping: {len(mapped_genes)}/{len(gene_symbols)} genes mapped to cBioPortal")
         
-        if unmapped_genes and self.config.get("warn_unmapped_genes", True):
-            logger.warning(f"Unmapped genes ({len(unmapped_genes)}): {unmapped_genes[:10]}...")
+        if self.config.get("include_unmapped_genes", False):
+            logger.info(f"Including {len(unmapped_genes)} unmapped genes with null Entrez IDs")
+        elif unmapped_genes:
+            if self.config.get("warn_unmapped_genes", True):
+                logger.warning(f"Skipping {len(unmapped_genes)} unmapped genes: {unmapped_genes[:10]}...")
+            logger.info(f"Will import expression data for {len(mapped_genes)} genes only")
         
         return {
             "mapped": mapped_genes,
@@ -865,7 +1000,8 @@ class H5adImporter:
                 f"{self.client.table_prefix}expression_matrix",
                 expression_records,
                 columns,
-                batch_size=self.batch_size
+                batch_size=self.batch_size,
+                desc=f"Expression batch {batch_start//self.batch_size + 1}"
             )
         
         adata_batch.file.close()
@@ -879,6 +1015,7 @@ class H5adImporter:
         cell_type_column: Optional[str],
         matrix_type: str,
         gene_mapping: Dict[str, Any],
+        interrupt_handler: InterruptibleImport,
     ) -> None:
         """Optimized streaming with persistent file handle."""
         
@@ -890,6 +1027,9 @@ class H5adImporter:
         logger.info("Opening h5ad file for streaming...")
         adata_stream = anndata.read_h5ad(file, backed='r')
         
+        # Add file handle cleanup for interrupt
+        interrupt_handler.add_cleanup(lambda: adata_stream.file.close() if hasattr(adata_stream, 'file') and adata_stream.file else None)
+        
         try:
             # Process in batches
             batch_size = self.batch_size
@@ -898,12 +1038,16 @@ class H5adImporter:
             
             logger.info(f"Processing {total_cells} cells in {total_batches} batches of {batch_size}")
             
-            with click.progressbar(length=total_batches, label="Processing batches") as bar:
+            # Use tqdm for the main batch progress instead of logging
+            with tqdm(total=total_batches, desc="Processing cell batches", unit="batch") as main_pbar:
                 for batch_num, batch_start in enumerate(range(0, total_cells, batch_size), 1):
+                    # Check for interrupts at the start of each batch
+                    interrupt_handler.check_interrupted()
+                    
                     batch_end = min(batch_start + batch_size, total_cells)
                     batch_cells = obs_df.iloc[batch_start:batch_end]
                     
-                    logger.debug(f"Batch {batch_num}/{total_batches}: cells {batch_start}-{batch_end-1}")
+                    main_pbar.set_description(f"Batch {batch_num}/{total_batches}")
                     
                     # Prepare cell records for this batch
                     cell_records = []
@@ -928,6 +1072,9 @@ class H5adImporter:
                     logger.debug(f"Inserting {len(cell_records)} cell records")
                     self.integration.insert_cells(cell_records)
                     
+                    # Check for interrupts before expression processing
+                    interrupt_handler.check_interrupted()
+                    
                     # Process expression data for this batch with persistent handle
                     logger.debug(f"Processing expression data for batch {batch_num}")
                     self._stream_expression_batch_optimized(
@@ -935,7 +1082,12 @@ class H5adImporter:
                         valid_gene_indices, matrix_type, cell_records
                     )
                     
-                    bar.update(1)
+                    # Update main progress bar
+                    main_pbar.update(1)
+                    main_pbar.set_postfix({
+                        'cells': f"{batch_end:,}/{total_cells:,}",
+                        'genes': len(valid_gene_indices)
+                    })
             
         finally:
             # Always close file handle
@@ -1004,7 +1156,8 @@ class H5adImporter:
                 f"{self.client.table_prefix}expression_matrix",
                 expression_records,
                 columns,
-                batch_size=self.batch_size
+                batch_size=self.batch_size,
+                desc=f"Expression batch {batch_start//self.batch_size + 1}"
             )
         else:
             logger.debug("No expression values to insert for this batch")
