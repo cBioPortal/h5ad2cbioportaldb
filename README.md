@@ -33,12 +33,6 @@ uv pip install -e .
 uv pip install -e ".[dev]"
 ```
 
-### Using pip
-
-```bash
-pip install h5ad2cbioportaldb
-```
-
 ## Quick Start
 
 ### 1. Configure Database Connection

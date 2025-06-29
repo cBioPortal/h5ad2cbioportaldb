@@ -218,16 +218,29 @@ class CBioPortalMapper:
     ) -> List[str]:
         """Generate mapping template files for user completion."""
         
-        # Load h5ad file
-        adata = anndata.read_h5ad(h5ad_file)
+        logger.info(f"Generating mapping templates from {h5ad_file}")
+        
+        # Fast metadata-only read to avoid loading expression matrix
+        try:
+            # Load only obs (metadata) for speed
+            adata = anndata.read_h5ad(h5ad_file, backed='r')  # Read-only mode
+            obs_df = adata.obs.copy()  # Copy just the metadata
+            adata.file.close()  # Close file handle immediately
+            logger.info(f"Fast metadata read: {len(obs_df)} cells")
+        except Exception as e:
+            logger.warning(f"Fast read failed ({e}), using standard read")
+            # Fallback to normal read
+            adata = anndata.read_h5ad(h5ad_file)
+            obs_df = adata.obs
+        
         output_path = Path(output_dir)
         output_path.mkdir(exist_ok=True, parents=True)
         
         files_created = []
         
         # Generate sample mapping template
-        if sample_obs_column and sample_obs_column in adata.obs.columns:
-            unique_samples = adata.obs[sample_obs_column].dropna().unique()
+        if sample_obs_column and sample_obs_column in obs_df.columns:
+            unique_samples = obs_df[sample_obs_column].dropna().unique()
             sample_template = pd.DataFrame({
                 "h5ad_sample_id": unique_samples,
                 "cbioportal_sample_id": [""] * len(unique_samples),
@@ -236,11 +249,11 @@ class CBioPortalMapper:
             sample_file = output_path / "sample_mapping_template.csv"
             sample_template.to_csv(sample_file, index=False)
             files_created.append(str(sample_file))
-            logger.info(f"Created sample mapping template: {sample_file}")
+            logger.info(f"Created sample mapping template: {sample_file} ({len(unique_samples)} samples)")
         
         # Generate patient mapping template
-        if patient_obs_column and patient_obs_column in adata.obs.columns:
-            unique_patients = adata.obs[patient_obs_column].dropna().unique()
+        if patient_obs_column and patient_obs_column in obs_df.columns:
+            unique_patients = obs_df[patient_obs_column].dropna().unique()
             patient_template = pd.DataFrame({
                 "h5ad_patient_id": unique_patients,
                 "cbioportal_patient_id": [""] * len(unique_patients),
@@ -249,7 +262,7 @@ class CBioPortalMapper:
             patient_file = output_path / "patient_mapping_template.csv"
             patient_template.to_csv(patient_file, index=False)
             files_created.append(str(patient_file))
-            logger.info(f"Created patient mapping template: {patient_file}")
+            logger.info(f"Created patient mapping template: {patient_file} ({len(unique_patients)} patients)")
         
         # Generate reference files with existing cBioPortal IDs
         self._create_reference_files(study_id, output_path, files_created)

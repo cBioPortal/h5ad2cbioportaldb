@@ -3,7 +3,7 @@ name = "h5ad2cbioportaldb"
 version = "0.1.0"
 description = "Import h5ad single-cell files into cBioPortal ClickHouse database with intelligent sample/patient mapping"
 authors = [
-    {name = "h5ad2cbioportaldb", email = "info@example.com"},
+    {name = "Ino de Bruijn", email = "ino@ino.bio"},
 ]
 dependencies = [
     "click>=8.1.0",
