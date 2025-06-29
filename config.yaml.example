@@ -1,0 +1,65 @@
+# cBioPortal ClickHouse Database Configuration
+cbioportal:
+  clickhouse:
+    host: localhost
+    port: 9000
+    database: cbioportal_database
+    username: default
+    password: ""
+    secure: false
+    timeout: 30
+
+# Import Configuration
+import:
+  table_prefix: "scRNA_"
+  auto_map_genes: true
+  validate_mappings: true
+  batch_size: 10000
+  max_memory_usage: "4GB"
+  
+# Sample/Patient Mapping Strategy
+mapping:
+  strategy: "flexible"  # "strict", "patient_only", "flexible"
+  create_synthetic_samples: true
+  synthetic_sample_suffix: "SC"
+  allow_unmapped_cells: true
+  require_patient_mapping: false
+  warn_missing_mappings: true
+
+# Cell Type Harmonization
+harmonization:
+  default_ontology: "CL"
+  confidence_threshold: 0.8
+  auto_harmonize: true
+  ontology_sources:
+    CL: "Cell Ontology"
+    UBERON: "Uber-anatomy ontology"
+
+# Validation Settings
+validation:
+  check_study_exists: true
+  warn_unmapped_genes: true
+  warn_missing_mappings: true
+  report_mapping_stats: true
+  min_cells_per_sample: 10
+  max_genes_per_dataset: 50000
+
+# Expression Matrix Configuration
+expression:
+  use_sparse_columns: true
+  matrix_types: ["raw", "normalized", "scaled"]
+  default_matrix_type: "raw"
+  min_expression_threshold: 0.0
+  compression: "zstd"
+
+# Embeddings Configuration
+embeddings:
+  supported_types: ["umap", "tsne", "pca"]
+  max_dimensions: 50
+  store_loadings: false
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: null  # Set to path for file logging
