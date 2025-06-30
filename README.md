@@ -73,6 +73,7 @@ This creates:
 - `patient_mapping_template.csv` - Map h5ad patients to cBioPortal patients  
 - `skcm_tcga_existing_samples.csv` - Reference of existing cBioPortal samples
 - `skcm_tcga_existing_patients.csv` - Reference of existing cBioPortal patients
+- `dataset_config.yaml` - Complete configuration file with metadata and ready-to-use commands
 
 ### 3. Complete the Mappings
 
@@ -95,6 +96,14 @@ DONOR_02,skcm_tcga_TCGA-BF-A1PV
 
 ### 4. Validate Mappings
 
+You can now use the generated config file for validation:
+
+```bash
+h5ad2cbioportaldb validate-mappings \
+  --config templates/dataset_config.yaml
+```
+
+Or use individual mapping files:
 ```bash
 h5ad2cbioportaldb validate-mappings \
   --study-id skcm_tcga \
@@ -104,10 +113,18 @@ h5ad2cbioportaldb validate-mappings \
 
 ### 5. Import Dataset (Two-Step Process)
 
-#### Step 5a: Generate Parquet Files
+#### Step 5a: Prepare Parquet Files
 
+Using the config file (recommended):
 ```bash
-h5ad2cbioportaldb import \
+h5ad2cbioportaldb import prepare \
+  --config templates/dataset_config.yaml \
+  --output-dir parquets/
+```
+
+Or with individual arguments:
+```bash
+h5ad2cbioportaldb import prepare \
   --file your_data.h5ad \
   --dataset-id sc_skcm_001 \
   --study-id skcm_tcga \
@@ -122,14 +139,16 @@ h5ad2cbioportaldb import \
 
 This generates compressed parquet files in the `parquets/` directory.
 
-#### Step 5b: Load Parquet Files to ClickHouse
+#### Step 5b: Load to ClickHouse
 
 ```bash
-h5ad2cbioportaldb load-parquets \
-  --parquet-dir parquets/
+h5ad2cbioportaldb import clickhouse \
+  --parquet-dir parquets/ \
+  --dataset-id sc_skcm_001 \
+  --study-id skcm_tcga
 ```
 
-This loads the generated parquet files into ClickHouse.
+This loads the generated parquet files into ClickHouse efficiently.
 
 ## Mapping Strategies
 
@@ -314,33 +333,27 @@ h5ad2cbioportaldb generate-mapping-template \
 
 # 3. Validate
 h5ad2cbioportaldb validate-mappings \
-  --study-id new_study \
-  --sample-mapping mappings/sample_mapping.csv \
-  --patient-mapping mappings/patient_mapping.csv
+  --config mappings/dataset_config.yaml
 
 # 4. Import (two steps)
-# Generate parquet files
-h5ad2cbioportaldb import \
-  --file new_study.h5ad \
-  --dataset-id sc_new_001 \
-  --study-id new_study \
-  --cell-type-column cell_type \
-  --sample-obs-column sample \
-  --patient-obs-column patient \
-  --sample-mapping mappings/sample_mapping.csv \
-  --patient-mapping mappings/patient_mapping.csv \
+# Prepare parquet files
+h5ad2cbioportaldb import prepare \
+  --config mappings/dataset_config.yaml \
   --output-dir parquets/
 
 # Load to ClickHouse
-h5ad2cbioportaldb load-parquets --parquet-dir parquets/
+h5ad2cbioportaldb import clickhouse \
+  --parquet-dir parquets/ \
+  --dataset-id sc_new_001 \
+  --study-id new_study
 ```
 
 ### Workflow 2: Existing Study Enhancement
 
 ```bash
 # Import into existing study with patient-level mapping (two steps)
-# Generate parquet files
-h5ad2cbioportaldb import \
+# Prepare parquet files
+h5ad2cbioportaldb import prepare \
   --file additional_samples.h5ad \
   --dataset-id sc_skcm_002 \
   --study-id skcm_tcga \
@@ -351,7 +364,10 @@ h5ad2cbioportaldb import \
   --output-dir parquets/
 
 # Load to ClickHouse
-h5ad2cbioportaldb load-parquets --parquet-dir parquets/
+h5ad2cbioportaldb import clickhouse \
+  --parquet-dir parquets/ \
+  --dataset-id sc_skcm_002 \
+  --study-id skcm_tcga
 
 # Harmonize cell types
 h5ad2cbioportaldb harmonize \
