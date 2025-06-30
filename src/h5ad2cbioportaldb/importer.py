@@ -764,7 +764,7 @@ class H5adImporter:
                     "matrix_type": pa.array([matrix_type] * len(X_coo.row)),
                     "count": pa.array(X_coo.data)
                 })
-                pq.write_table(table, os.path.join(output_dir, f"{self.client.table_prefix}expression_batch_{batch_idx}.parquet"), compression=None)
+                pq.write_table(table, os.path.join(output_dir, f"{self.client.table_prefix}expression_batch_{batch_idx}.parquet"), compression='snappy')
                 t1 = time.perf_counter()
                 logger.debug(f"  Write Parquet: {t1 - t0:.3f}s")
 

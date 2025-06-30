@@ -102,7 +102,9 @@ h5ad2cbioportaldb validate-mappings \
   --patient-mapping patient_mapping.csv
 ```
 
-### 5. Import Dataset
+### 5. Import Dataset (Two-Step Process)
+
+#### Step 5a: Generate Parquet Files
 
 ```bash
 h5ad2cbioportaldb import \
@@ -114,8 +116,20 @@ h5ad2cbioportaldb import \
   --sample-mapping sample_mapping.csv \
   --patient-obs-column donor_id \
   --patient-mapping patient_mapping.csv \
-  --description "Single-cell RNA-seq from SKCM patients"
+  --description "Single-cell RNA-seq from SKCM patients" \
+  --output-dir parquets/
 ```
+
+This generates compressed parquet files in the `parquets/` directory.
+
+#### Step 5b: Load Parquet Files to ClickHouse
+
+```bash
+h5ad2cbioportaldb load-parquets \
+  --parquet-dir parquets/
+```
+
+This loads the generated parquet files into ClickHouse.
 
 ## Mapping Strategies
 
@@ -304,7 +318,8 @@ h5ad2cbioportaldb validate-mappings \
   --sample-mapping mappings/sample_mapping.csv \
   --patient-mapping mappings/patient_mapping.csv
 
-# 4. Import
+# 4. Import (two steps)
+# Generate parquet files
 h5ad2cbioportaldb import \
   --file new_study.h5ad \
   --dataset-id sc_new_001 \
@@ -313,13 +328,18 @@ h5ad2cbioportaldb import \
   --sample-obs-column sample \
   --patient-obs-column patient \
   --sample-mapping mappings/sample_mapping.csv \
-  --patient-mapping mappings/patient_mapping.csv
+  --patient-mapping mappings/patient_mapping.csv \
+  --output-dir parquets/
+
+# Load to ClickHouse
+h5ad2cbioportaldb load-parquets --parquet-dir parquets/
 ```
 
 ### Workflow 2: Existing Study Enhancement
 
 ```bash
-# Import into existing study with patient-level mapping
+# Import into existing study with patient-level mapping (two steps)
+# Generate parquet files
 h5ad2cbioportaldb import \
   --file additional_samples.h5ad \
   --dataset-id sc_skcm_002 \
@@ -327,7 +347,11 @@ h5ad2cbioportaldb import \
   --cell-type-column leiden \
   --patient-obs-column patient_id \
   --patient-mapping patient_mapping.csv \
-  --description "Additional single-cell samples"
+  --description "Additional single-cell samples" \
+  --output-dir parquets/
+
+# Load to ClickHouse
+h5ad2cbioportaldb load-parquets --parquet-dir parquets/
 
 # Harmonize cell types
 h5ad2cbioportaldb harmonize \
