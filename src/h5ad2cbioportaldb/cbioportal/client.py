@@ -1,6 +1,11 @@
 """ClickHouse client for cBioPortal database operations."""
 
+import csv
 import logging
+import subprocess
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import clickhouse_connect
@@ -20,7 +25,8 @@ class CBioPortalClient:
         self.config = config.get("clickhouse", {})
         self.database = self.config.get("database", "cbioportal")
         self.table_prefix = config.get("table_prefix", "scRNA_")
-        
+        self.temp_dir = tempfile.mkdtemp(prefix="h5ad2cbioportaldb-")
+
         self._client: Optional[Client] = None
         self._connect()
 
@@ -81,30 +87,40 @@ class CBioPortalClient:
         self,
         table: str,
         df: pd.DataFrame,
-        batch_size: int = 10000,
         desc: Optional[str] = None,
     ) -> None:
-        """Insert DataFrame into table in batches with progress tracking."""
+        """Save DataFrame to a TSV file and use clickhouse-client to import it."""
+        if df.empty:
+            logger.warning(f"DataFrame is empty, skipping insert to {table}")
+            return
+            
         try:
             full_table_name = f"{self.database}.{table}"
-            total_batches = (len(df) + batch_size - 1) // batch_size
-            
-            # Create progress bar
-            progress_desc = desc or f"Inserting into {table}"
-            
-            with tqdm(total=total_batches, desc=progress_desc, unit="batch") as pbar:
-                for i in range(0, len(df), batch_size):
-                    batch = df.iloc[i:i + batch_size]
-                    self.client.insert_df(full_table_name, batch)
-                    
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        'rows': f"{min(i + batch_size, len(df)):,}/{len(df):,}",
-                        'batch_size': len(batch)
-                    })
-                
+            temp_file_path = Path(self.temp_dir) / f"{table}.tsv"
+
+            # Save DataFrame to TSV
+            df.to_csv(temp_file_path, sep="\t", index=False, header=False, quoting=csv.QUOTE_MINIMAL)
+
+            # Construct clickhouse-client command - no column specification needed since we're using all columns
+            command = (
+                f"clickhouse-client --host {self.config.get('host', 'localhost')} "
+                f"--user {self.config.get('username', 'default')} "
+                f"--password '{self.config.get('password', '')}' "
+                f"--database {self.database} "
+                f'--query "INSERT INTO {full_table_name} FORMAT TSV" '
+                f'< "{temp_file_path}"'
+            )
+
+            # Execute command
+            result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
+
             logger.info(f"Successfully inserted {len(df):,} rows into {full_table_name}")
-            
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Insert failed for table {table}: {e}")
+            if e.stderr:
+                logger.error(f"clickhouse-client stderr: {e.stderr}")
+            raise
         except Exception as e:
             logger.error(f"Insert failed for table {table}: {e}")
             raise
@@ -114,30 +130,43 @@ class CBioPortalClient:
         table: str,
         data: List[List[Any]],
         columns: List[str],
-        batch_size: int = 10000,
         desc: Optional[str] = None,
     ) -> None:
-        """Bulk insert data into table with progress tracking."""
+        """Save data to a TSV file and use clickhouse-client to import it."""
+        if not data:
+            logger.warning(f"Data list is empty, skipping bulk insert to {table}")
+            return
+            
         try:
             full_table_name = f"{self.database}.{table}"
-            total_batches = (len(data) + batch_size - 1) // batch_size
-            
-            # Create progress bar
-            progress_desc = desc or f"Inserting into {table}"
-            
-            with tqdm(total=total_batches, desc=progress_desc, unit="batch") as pbar:
-                for i in range(0, len(data), batch_size):
-                    batch_data = data[i:i + batch_size]
-                    self.client.insert(full_table_name, batch_data, column_names=columns)
-                    
-                    pbar.update(1)
-                    pbar.set_postfix({
-                        'rows': f"{min(i + batch_size, len(data)):,}/{len(data):,}",
-                        'batch_size': len(batch_data)
-                    })
-                
+            temp_file_path = Path(self.temp_dir) / f"{table}.tsv"
+
+            # Save data to TSV
+            with open(temp_file_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f, delimiter="\t", quoting=csv.QUOTE_MINIMAL)
+                writer.writerows(data)
+
+            # Construct clickhouse-client command
+            columns_str = ",".join(columns)
+            command = (
+                f"clickhouse-client --host {self.config.get('host', 'localhost')} "
+                f"--user {self.config.get('username', 'default')} "
+                f"--password '{self.config.get('password', '')}' "
+                f"--database {self.database} "
+                f'--query "INSERT INTO {full_table_name} ({columns_str}) FORMAT TSV" '
+                f'< "{temp_file_path}"'
+            )
+
+            # Execute command
+            result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
+
             logger.info(f"Successfully bulk inserted {len(data):,} rows into {full_table_name}")
-            
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Bulk insert failed for table {table}: {e}")
+            if e.stderr:
+                logger.error(f"clickhouse-client stderr: {e.stderr}")
+            raise
         except Exception as e:
             logger.error(f"Bulk insert failed for table {table}: {e}")
             raise
@@ -393,8 +422,17 @@ class CBioPortalClient:
             return pd.DataFrame()
 
     def close(self) -> None:
-        """Close database connection."""
+        """Close database connection and clean up temporary files."""
         if self._client:
             self._client.close()
             self._client = None
             logger.info("ClickHouse connection closed")
+        
+        # Clean up temporary directory
+        try:
+            import shutil
+            if hasattr(self, 'temp_dir') and Path(self.temp_dir).exists():
+                shutil.rmtree(self.temp_dir)
+                logger.info(f"Removed temporary directory: {self.temp_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to remove temporary directory {self.temp_dir}: {e}")

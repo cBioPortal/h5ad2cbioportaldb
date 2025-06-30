@@ -176,7 +176,6 @@ class CBioPortalIntegration:
         self,
         expression_data: List[List[Any]],
         columns: List[str],
-        batch_size: int = 50000,
     ) -> None:
         """Insert expression matrix data."""
         table_name = f"{self.client.table_prefix}expression_matrix"
@@ -184,7 +183,6 @@ class CBioPortalIntegration:
             table_name, 
             expression_data, 
             columns, 
-            batch_size,
             desc="Expression matrix"
         )
 
@@ -192,7 +190,6 @@ class CBioPortalIntegration:
         self,
         embedding_data: List[List[Any]],
         columns: List[str],
-        batch_size: int = 50000,
     ) -> None:
         """Insert embedding data."""
         table_name = f"{self.client.table_prefix}cell_embeddings"
@@ -200,7 +197,6 @@ class CBioPortalIntegration:
             table_name, 
             embedding_data, 
             columns, 
-            batch_size,
             desc="Cell embeddings"
         )
 

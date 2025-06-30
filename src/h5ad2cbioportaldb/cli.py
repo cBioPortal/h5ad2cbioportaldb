@@ -57,12 +57,96 @@ def load_dataset_config(dataset_config_path: str) -> dict:
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
 @click.pass_context
 def cli(ctx: click.Context, config: Optional[str], verbose: bool) -> None:
-    """h5ad2cbioportaldb: Import h5ad single-cell files into cBioPortal ClickHouse database."""
+    """h5ad2cbioportaldb: Import h5ad single-cell files into cBioPortal ClickHouse database (in-memory import only)."""
     ctx.ensure_object(dict)
     ctx.obj["config"] = load_config(config)
     
     log_level = "DEBUG" if verbose else ctx.obj["config"].get("logging", {}).get("level", "INFO")
     setup_logging(log_level)
+
+
+@cli.group(name="import")
+@click.pass_context
+def import_group(ctx: click.Context):
+    """Import workflow: prepare TSVs and load into ClickHouse."""
+    pass
+
+
+@import_group.command("prepare")
+@click.option("--file", "-f", type=click.Path(exists=True), required=True, help="Path to h5ad file")
+@click.option("--dataset-id", required=True, help="Unique dataset identifier")
+@click.option("--study-id", required=True, help="cBioPortal study identifier")
+@click.option("--output-dir", required=True, type=click.Path(), help="Directory to write TSV files")
+@click.option("--cell-type-column", help="Column name for cell types in obs")
+@click.option("--sample-obs-column", help="Column name for sample IDs in obs")
+@click.option("--patient-obs-column", help="Column name for patient IDs in obs")
+@click.option("--sample-mapping", type=click.Path(exists=True), help="CSV file mapping h5ad samples to cBioPortal")
+@click.option("--patient-mapping", type=click.Path(exists=True), help="CSV file mapping h5ad patients to cBioPortal")
+@click.option("--description", help="Dataset description")
+@click.option("--matrix-type", default="raw", help="Expression matrix type to import")
+@click.option("--dry-run", is_flag=True, help="Validate without importing")
+@click.option("--overwrite", is_flag=True, help="Overwrite existing dataset")
+@click.option("--batch-size", default=10000, show_default=True, type=int, help="Batch size for expression matrix export")
+@click.pass_context
+def prepare(
+    ctx: click.Context,
+    file: str,
+    dataset_id: str,
+    study_id: str,
+    output_dir: str,
+    cell_type_column: Optional[str],
+    sample_obs_column: Optional[str],
+    patient_obs_column: Optional[str],
+    sample_mapping: Optional[str],
+    patient_mapping: Optional[str],
+    description: Optional[str],
+    matrix_type: str,
+    dry_run: bool,
+    overwrite: bool,
+    batch_size: int,
+):
+    """Prepare (generate) TSV files from h5ad file for later import into ClickHouse."""
+    config = ctx.obj["config"]
+    client = CBioPortalClient(config.get("cbioportal", {}))
+    importer = H5adImporter(client, config.get("import", {}))
+    importer.prepare_tsvs(
+        file=file,
+        dataset_id=dataset_id,
+        study_id=study_id,
+        output_dir=output_dir,
+        cell_type_column=cell_type_column,
+        sample_obs_column=sample_obs_column,
+        patient_obs_column=patient_obs_column,
+        sample_mapping_file=sample_mapping,
+        patient_mapping_file=patient_mapping,
+        description=description,
+        matrix_type=matrix_type,
+        dry_run=dry_run,
+        overwrite=overwrite,
+        batch_size=batch_size,
+    )
+
+
+@import_group.command("clickhouse")
+@click.option("--parquet-dir", required=True, type=click.Path(exists=True), help="Directory containing Parquet files to import")
+@click.option("--dataset-id", required=True, help="Unique dataset identifier")
+@click.option("--study-id", required=True, help="cBioPortal study identifier")
+@click.pass_context
+def clickhouse(
+    ctx: click.Context,
+    parquet_dir: str,
+    dataset_id: str,
+    study_id: str,
+):
+    """Load prepared Parquet files into ClickHouse database."""
+    config = ctx.obj["config"]
+    client = CBioPortalClient(config.get("cbioportal", {}))
+    importer = H5adImporter(client, config.get("import", {}))
+    importer.load_parquets_to_clickhouse(
+        parquet_dir=parquet_dir,
+        dataset_id=dataset_id,
+        study_id=study_id,
+    )
 
 
 @cli.command()

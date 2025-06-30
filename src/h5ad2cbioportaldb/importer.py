@@ -19,60 +19,8 @@ from .cbioportal.integration import CBioPortalIntegration
 from .cbioportal.schema import CBioPortalSchema
 from .mapper import CBioPortalMapper
 
-
-logger = logging.getLogger(__name__)
-
-
-class InterruptibleImport:
-    """Context manager for handling interrupts gracefully during import."""
-    
-    def __init__(self):
-        self.interrupted = False
-        self.original_handlers = {}
-        self.cleanup_functions = []
-    
-    def __enter__(self):
-        # Set up signal handlers
-        for sig in [signal.SIGINT, signal.SIGTERM]:
-            self.original_handlers[sig] = signal.signal(sig, self._signal_handler)
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        # Restore original signal handlers
-        for sig, handler in self.original_handlers.items():
-            signal.signal(sig, handler)
-        
-        # Run cleanup functions
-        for cleanup_func in self.cleanup_functions:
-            try:
-                cleanup_func()
-            except Exception as e:
-                logger.warning(f"Cleanup function failed: {e}")
-    
-    def _signal_handler(self, signum, frame):
-        """Handle interrupt signals."""
-        self.interrupted = True
-        logger.info(f"Received signal {signum}, initiating graceful shutdown...")
-        
-        # Run immediate cleanup
-        for cleanup_func in self.cleanup_functions:
-            try:
-                cleanup_func()
-            except Exception as e:
-                logger.warning(f"Cleanup function failed: {e}")
-        
-        # Exit gracefully
-        click.echo("\n🛑 Import interrupted by user")
-        sys.exit(1)
-    
-    def add_cleanup(self, func):
-        """Add a cleanup function to be called on interrupt."""
-        self.cleanup_functions.append(func)
-    
-    def check_interrupted(self):
-        """Check if we've been interrupted and raise if so."""
-        if self.interrupted:
-            raise KeyboardInterrupt("Import was interrupted")
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 logger = logging.getLogger(__name__)
@@ -82,14 +30,11 @@ class H5adImporter:
     """Main importer for h5ad files into cBioPortal database."""
 
     def __init__(self, client: CBioPortalClient, config: Dict[str, Any]) -> None:
-        """Initialize importer with client and configuration."""
         self.client = client
         self.config = config
         self.schema = CBioPortalSchema(client)
         self.integration = CBioPortalIntegration(client, config)
         self.mapper = CBioPortalMapper(client, config.get("mapping", {}))
-        
-        # Import configuration
         self.auto_map_genes = config.get("auto_map_genes", True)
         self.validate_mappings = config.get("validate_mappings", True)
         self.batch_size = config.get("batch_size", 10000)
@@ -110,51 +55,27 @@ class H5adImporter:
         dry_run: bool = False,
         overwrite: bool = False,
     ) -> Dict[str, Any]:
-        """Import h5ad file into cBioPortal database."""
-        
+        """Import h5ad file into cBioPortal database (in-memory only)."""
         logger.info(f"Starting import of dataset {dataset_id} from {file}")
-        
-        with InterruptibleImport() as interrupt_handler:
-            # Add database connection cleanup
-            interrupt_handler.add_cleanup(lambda: self.client.close())
-            
-            # Validate inputs
-            self._validate_import_inputs(file, dataset_id, study_id, matrix_type, overwrite)
-            
-            # Check file dimensions first without loading full data
-            click.echo("📁 Checking h5ad file dimensions...")
-            n_obs, n_vars = self._get_h5ad_dimensions(file)
-            click.echo(f"✅ Found h5ad file: {n_obs:,} cells, {n_vars:,} genes")
-            
-            # Check for interrupts
-            interrupt_handler.check_interrupted()
-            
-            # Validate study exists
-            if not self.schema.validate_study_exists(study_id):
-                raise ValueError(f"Study {study_id} not found in cBioPortal")
-            
-            # Choose import strategy based on size
-            if n_obs > 50000:  # Use streaming for datasets with >50k cells
-                click.echo(f"🔄 Large dataset detected ({n_obs:,} cells), using streaming import")
-                return self._streaming_import(
-                    file, None, dataset_id, study_id, cell_type_column,
-                    sample_obs_column, patient_obs_column, sample_mapping_file,
-                    patient_mapping_file, description, matrix_type, dry_run, overwrite,
-                    interrupt_handler
-                )
-            
-            # For small datasets, load fully into memory
-            click.echo(f"⚡ Small dataset ({n_obs:,} cells), using in-memory import")
-            click.echo("📁 Loading h5ad file into memory...")
-            adata = self._load_h5ad_file(file)
-            
-            return self._memory_import(
-                adata, dataset_id, study_id, cell_type_column,
-                sample_obs_column, patient_obs_column, sample_mapping_file,
-                patient_mapping_file, description, matrix_type, dry_run, file,
-                interrupt_handler
-            )
-        
+        # Validate inputs
+        self._validate_import_inputs(file, dataset_id, study_id, matrix_type, overwrite)
+        # Check file dimensions first without loading full data
+        click.echo("📁 Checking h5ad file dimensions...")
+        n_obs, n_vars = self._get_h5ad_dimensions(file)
+        logger.info(f"✅ Found h5ad file: {n_obs:,} cells, {n_vars:,} genes")
+        # Validate study exists
+        if not self.schema.validate_study_exists(study_id):
+            raise ValueError(f"Study {study_id} not found in cBioPortal")
+        # Always use in-memory import
+        click.echo(f"⚡ Importing dataset ({n_obs:,} cells) using in-memory import")
+        click.echo("📁 Loading h5ad file into memory...")
+        adata = self._load_h5ad_file(file)
+        return self._memory_import(
+            adata, dataset_id, study_id, cell_type_column,
+            sample_obs_column, patient_obs_column, sample_mapping_file,
+            patient_mapping_file, description, matrix_type, dry_run, file
+        )
+
     def _memory_import(
         self,
         adata: anndata.AnnData,
@@ -169,7 +90,6 @@ class H5adImporter:
         matrix_type: str,
         dry_run: bool,
         file: str,
-        interrupt_handler: InterruptibleImport,
     ) -> Dict[str, Any]:
         """Original in-memory import for smaller datasets."""
         
@@ -217,105 +137,6 @@ class H5adImporter:
         
         # Generate final summary
         return self._generate_import_summary(dataset_id, adata, mapping_stats, gene_mapping)
-
-    def _streaming_import(
-        self,
-        file: str,
-        adata: Optional[anndata.AnnData],  # Now optional since we don't pre-load for large datasets
-        dataset_id: str,
-        study_id: str,
-        cell_type_column: Optional[str],
-        sample_obs_column: Optional[str],
-        patient_obs_column: Optional[str],
-        sample_mapping_file: Optional[str],
-        patient_mapping_file: Optional[str],
-        description: Optional[str],
-        matrix_type: str,
-        dry_run: bool,
-        overwrite: bool,
-        interrupt_handler: InterruptibleImport,
-    ) -> Dict[str, Any]:
-        """Streaming import for large datasets to minimize memory usage."""
-        
-        # First pass: analyze metadata and mappings using backed mode
-        click.echo("🔍 Pass 1: Analyzing metadata and mappings...")
-        
-        # Open in backed mode for metadata analysis
-        adata_backed = anndata.read_h5ad(file, backed='r')
-        # Add file handle cleanup
-        interrupt_handler.add_cleanup(lambda: adata_backed.file.close() if hasattr(adata_backed, 'file') and adata_backed.file else None)
-        
-        obs_df = adata_backed.obs.copy()  # Copy metadata only
-        var_df = adata_backed.var.copy()  # Copy gene metadata only
-        
-        # Resolve mappings using metadata only
-        click.echo("📋 Resolving sample/patient mappings...")
-        interrupt_handler.check_interrupted()
-        
-        # Use a simpler progress approach that doesn't block signals
-        resolved_mappings, mapping_stats = self.mapper.resolve_mappings(
-            adata_backed, study_id, sample_obs_column, patient_obs_column,
-            sample_mapping_file, patient_mapping_file
-        )
-        
-        interrupt_handler.check_interrupted()
-        
-        # Map genes using var metadata
-        click.echo("🧬 Mapping genes to cBioPortal...")
-        gene_mapping = self._map_genes_to_cbioportal_from_var(var_df, dataset_id)
-        
-        # Validate mappings if requested
-        if self.validate_mappings and not dry_run:
-            self._validate_before_import(study_id, resolved_mappings, gene_mapping)
-        
-        # Prepare dataset record
-        dataset_record = self._prepare_dataset_record(
-            adata_backed, dataset_id, study_id, file, description, mapping_stats
-        )
-        
-        adata_backed.file.close()  # Close backed file
-        
-        if dry_run:
-            return {
-                "dataset_id": dataset_id,
-                "study_id": study_id,
-                "n_cells": len(obs_df),
-                "n_genes": len(gene_mapping["mapped"]),  # Use mapped genes, not total genes
-                "n_genes_total": len(var_df),
-                "n_genes_unmapped": len(gene_mapping["unmapped"]),
-                "mapping_statistics": mapping_stats,
-                "dry_run": True,
-            }
-        
-        # Create tables if they don't exist
-        self.client.create_tables_if_not_exist()
-        
-        # Insert dataset record
-        click.echo("📝 Creating dataset record...")
-        self.integration.insert_dataset(dataset_record)
-        
-        # Insert gene records
-        gene_records = self._prepare_gene_records(dataset_id, gene_mapping)
-        click.echo(f"🧬 Inserting {len(gene_records):,} gene records...")
-        self.integration.insert_genes(gene_records)
-        
-        # Stream cell and expression data in batches
-        click.echo("💾 Importing cell and expression data...")
-        self._stream_cell_and_expression_data_optimized(
-            file, dataset_id, obs_df, resolved_mappings, 
-            cell_type_column, matrix_type, gene_mapping, interrupt_handler
-        )
-        
-        # Generate final summary
-        return {
-            "dataset_id": dataset_id,
-            "n_cells": len(obs_df),
-            "n_genes": len(gene_mapping["mapped"]),  # Use mapped genes, not total genes
-            "n_genes_total": len(var_df),
-            "n_genes_unmapped": len(gene_mapping["unmapped"]),
-            "mapping_statistics": mapping_stats,
-            "success": True,
-        }
 
     def _validate_import_inputs(
         self, file: str, dataset_id: str, study_id: str, matrix_type: str, overwrite: bool = False
@@ -635,13 +456,13 @@ class H5adImporter:
             # Insert expression matrix
             expr_data, expr_columns = expression_data
             logger.info(f"Inserting {len(expr_data)} expression values...")
-            self.integration.insert_expression_matrix(expr_data, expr_columns, self.batch_size)
-            
+            self.integration.insert_expression_matrix(expr_data, expr_columns)
+
             # Insert embeddings if available
             if embedding_data:
                 emb_data, emb_columns = embedding_data
                 logger.info(f"Inserting {len(emb_data)} embedding values...")
-                self.integration.insert_embeddings(emb_data, emb_columns, self.batch_size)
+                self.integration.insert_embeddings(emb_data, emb_columns)
             
             logger.info("All data inserted successfully")
             
@@ -811,356 +632,245 @@ class H5adImporter:
         
         return adata
 
-    def _map_genes_to_cbioportal_from_var(self, var_df: pd.DataFrame, dataset_id: str) -> Dict[str, Any]:
-        """Map genes from var DataFrame to cBioPortal gene table."""
-        
-        # Extract gene symbols - handle different formats
-        if 'feature_name' in var_df.columns:
-            # Parse Hugo symbols from feature_name column
-            gene_symbols = []
-            original_names = var_df['feature_name'].tolist()
-            
-            for name in original_names:
-                if '_ENSG' in name:
-                    # Extract Hugo symbol before _ENSG (format: hugoname_ENSGxxxxx)
-                    hugo_symbol = name.split('_ENSG')[0]
-                    gene_symbols.append(hugo_symbol)
-                elif name.startswith('ENSG'):
-                    # Pure ENSEMBL ID - skip for now as we need Hugo symbols
-                    gene_symbols.append(None)
-                else:
-                    # Use as-is if already a gene symbol
-                    gene_symbols.append(name)
-                    
-            logger.info(f"Parsed Hugo symbols from feature_name column: {len([g for g in gene_symbols if g])} valid genes")
-        else:
-            # Fallback to index
-            gene_symbols = var_df.index.tolist()
-            logger.info(f"Using gene symbols from var index: {len(gene_symbols)} genes")
-        
-        # Get existing genes from cBioPortal (filter out None values)
-        valid_gene_symbols = [g for g in gene_symbols if g is not None]
-        existing_genes_df = self.client.get_existing_genes(valid_gene_symbols)
-        existing_genes = {
-            row["hugo_gene_symbol"]: {
-                "entrez_gene_id": row["entrez_gene_id"],
-                "gene_symbol": row["hugo_gene_symbol"]
-            }
-            for _, row in existing_genes_df.iterrows()
-        }
-        
-        # Create mapping
-        mapped_genes = []
-        unmapped_genes = []
-        
-        for idx, gene_symbol in enumerate(gene_symbols):
-            if gene_symbol and gene_symbol in existing_genes:
-                mapped_genes.append({
-                    "idx": idx,
-                    "symbol": gene_symbol,
-                    "entrez_id": existing_genes[gene_symbol]["entrez_gene_id"]
-                })
-            elif gene_symbol:
-                # Include unmapped genes with null entrez_id if configured
-                if self.config.get("include_unmapped_genes", False):
-                    mapped_genes.append({
-                        "idx": idx,
-                        "symbol": gene_symbol,
-                        "entrez_id": None
-                    })
-                else:
-                    unmapped_genes.append(gene_symbol)
-        
-        logger.info(f"Gene mapping: {len(mapped_genes)}/{len(gene_symbols)} genes mapped to cBioPortal")
-        
-        if self.config.get("include_unmapped_genes", False):
-            logger.info(f"Including {len(unmapped_genes)} unmapped genes with null Entrez IDs")
-        elif unmapped_genes:
-            if self.config.get("warn_unmapped_genes", True):
-                logger.warning(f"Skipping {len(unmapped_genes)} unmapped genes: {unmapped_genes[:10]}...")
-            logger.info(f"Will import expression data for {len(mapped_genes)} genes only")
-        
-        return {
-            "mapped": mapped_genes,
-            "unmapped": unmapped_genes,
-            "total": len(gene_symbols)
-        }
-
-    def _stream_cell_and_expression_data(
+    def prepare_tsvs(
         self,
         file: str,
         dataset_id: str,
-        obs_df: pd.DataFrame,
-        resolved_mappings: Dict[str, Any],
-        cell_type_column: Optional[str],
-        matrix_type: str,
-        gene_mapping: Dict[str, Any],
+        study_id: str,
+        output_dir: str,
+        cell_type_column: Optional[str] = None,
+        sample_obs_column: Optional[str] = None,
+        patient_obs_column: Optional[str] = None,
+        sample_mapping_file: Optional[str] = None,
+        patient_mapping_file: Optional[str] = None,
+        description: Optional[str] = None,
+        matrix_type: str = "raw",
+        dry_run: bool = False,
+        overwrite: bool = False,
+        batch_size: int = 10000,
     ) -> None:
-        """Stream cell and expression data in batches to minimize memory usage."""
-        
-        logger.info("Pass 2: Streaming cell and expression data in batches...")
-        
-        # Get valid gene indices
-        valid_gene_indices = [g["idx"] for g in gene_mapping["mapped"]]
-        
-        # Process in batches
-        batch_size = self.batch_size
-        total_cells = len(obs_df)
-        
-        for batch_start in range(0, total_cells, batch_size):
-            batch_end = min(batch_start + batch_size, total_cells)
-            batch_cells = obs_df.iloc[batch_start:batch_end]
-            
-            logger.info(f"Processing batch {batch_start//batch_size + 1}: cells {batch_start}-{batch_end}")
-            
-            # Prepare cell records for this batch
-            cell_records = []
-            for idx, (cell_id, row) in enumerate(batch_cells.iterrows()):
-                mapping_info = resolved_mappings.get(str(cell_id), {})
-                
-                record = {
-                    "dataset_id": dataset_id,
-                    "cell_id": str(cell_id),
-                    "cell_barcode": row.get("barcode", str(cell_id)),
-                    "sample_unique_id": mapping_info.get("sample_id"),
-                    "patient_unique_id": mapping_info.get("patient_id"),
-                    "original_cell_type": row.get(cell_type_column, "Unknown") if cell_type_column else "Unknown",
-                    "harmonized_cell_type_id": None,
-                    "harmonization_confidence": None,
-                    "mapping_strategy": mapping_info.get("strategy", "no_mapping"),
-                    "obs_data": json.dumps(row.to_dict()),
-                }
-                cell_records.append(record)
-            
-            # Insert cell records
-            self.integration.insert_cells(cell_records)
-            
-            # Process expression data for this batch
-            self._stream_expression_batch(
-                file, dataset_id, batch_start, batch_end, 
-                valid_gene_indices, matrix_type, cell_records
-            )
-            
-            logger.info(f"Completed batch {batch_start//batch_size + 1}")
-        
-        logger.info("Streaming import completed")
+        """
+        Prepare (generate) Parquet files for all tables from the h5ad file and write them to output_dir.
+        Uses backed mode and batching for large matrices. Only Parquet output.
+        """
+        import os
+        import pandas as pd
+        import gc
+        import signal
+        import time
+        from pathlib import Path
+        from scipy import sparse
+        from tqdm import tqdm
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        logger = logging.getLogger(__name__)
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    def _stream_expression_batch(
-        self,
-        file: str,
-        dataset_id: str,
-        batch_start: int,
-        batch_end: int,
-        valid_gene_indices: List[int],
-        matrix_type: str,
-        cell_records: List[Dict[str, Any]],
-    ) -> None:
-        """Stream expression data for a batch of cells."""
-        
-        # Read expression data for this batch only
-        adata_batch = anndata.read_h5ad(file, backed='r')
-        
-        # Select appropriate matrix
-        if matrix_type == "raw" and adata_batch.raw is not None:
-            X_batch = adata_batch.raw.X[batch_start:batch_end, :]
-        elif matrix_type == "normalized" and "normalized" in adata_batch.layers:
-            X_batch = adata_batch.layers["normalized"][batch_start:batch_end, :]
-        elif matrix_type == "scaled" and "scaled" in adata_batch.layers:
-            X_batch = adata_batch.layers["scaled"][batch_start:batch_end, :]
-        else:
-            X_batch = adata_batch.X[batch_start:batch_end, :]
-        
-        # Convert to sparse if needed
-        if not sparse.issparse(X_batch):
-            X_batch = sparse.csr_matrix(X_batch)
-        
-        # Filter to valid genes only
-        X_batch = X_batch[:, valid_gene_indices]
-        
-        # Prepare expression records
-        expression_records = []
-        cell_ids = [record["cell_id"] for record in cell_records]
-        
-        # Convert sparse matrix to records
-        X_coo = X_batch.tocoo()
-        for i, j, value in zip(X_coo.row, X_coo.col, X_coo.data):
-            if value != 0:  # Skip zero values for SPARSE columns
-                expression_records.append([
-                    dataset_id,
-                    cell_ids[i],
-                    valid_gene_indices[j],
-                    matrix_type,
-                    float(value)
-                ])
-        
-        # Insert expression data
-        if expression_records:
-            columns = ["dataset_id", "cell_id", "gene_idx", "matrix_type", "count"]
-            self.client.bulk_insert(
-                f"{self.client.table_prefix}expression_matrix",
-                expression_records,
-                columns,
-                batch_size=self.batch_size,
-                desc=f"Expression batch {batch_start//self.batch_size + 1}"
-            )
-        
-        adata_batch.file.close()
+        interrupted = False
+        def handle_interrupt(signum, frame):
+            nonlocal interrupted
+            interrupted = True
+            logger.warning("Interrupted by user (Ctrl+C). Cleaning up and exiting...")
 
-    def _stream_cell_and_expression_data_optimized(
-        self,
-        file: str,
-        dataset_id: str,
-        obs_df: pd.DataFrame,
-        resolved_mappings: Dict[str, Any],
-        cell_type_column: Optional[str],
-        matrix_type: str,
-        gene_mapping: Dict[str, Any],
-        interrupt_handler: InterruptibleImport,
-    ) -> None:
-        """Highly optimized streaming with vectorized operations and efficient batching."""
-        
-        # Get valid gene indices as numpy array for faster indexing
-        valid_gene_indices = np.array([g["idx"] for g in gene_mapping["mapped"]], dtype=np.int32)
-        logger.info(f"Processing {len(valid_gene_indices)} mapped genes")
-        
-        # Use larger batch sizes for better performance
-        cell_batch_size = max(self.batch_size, 5000)  # Larger batches for cells
-        expr_batch_size = max(self.batch_size * 10, 50000)  # Much larger batches for expression data
-        
-        # Open file once and keep handle
-        logger.info("Opening h5ad file for streaming...")
-        adata_stream = anndata.read_h5ad(file, backed='r')
-        
-        # Add file handle cleanup for interrupt
-        interrupt_handler.add_cleanup(lambda: adata_stream.file.close() if hasattr(adata_stream, 'file') and adata_stream.file else None)
-        
+        old_handler = signal.signal(signal.SIGINT, handle_interrupt)
+
         try:
-            total_cells = len(obs_df)
-            total_batches = (total_cells + cell_batch_size - 1) // cell_batch_size
-            
-            logger.info(f"Processing {total_cells} cells in {total_batches} batches of {cell_batch_size}")
-            
-            # Pre-compute mapping arrays for vectorized operations
-            cell_ids = obs_df.index.astype(str).values
-            sample_ids = np.array([resolved_mappings.get(cid, {}).get("sample_id") for cid in cell_ids])
-            patient_ids = np.array([resolved_mappings.get(cid, {}).get("patient_id") for cid in cell_ids])
-            mapping_strategies = np.array([resolved_mappings.get(cid, {}).get("strategy", "no_mapping") for cid in cell_ids])
-            
-            # Pre-compute cell type data
-            if cell_type_column and cell_type_column in obs_df.columns:
-                cell_types = obs_df[cell_type_column].fillna("Unknown").astype(str).values
-            else:
-                cell_types = np.full(total_cells, "Unknown", dtype=str)
-            
-            # Pre-serialize obs data in batches to reduce JSON overhead
-            obs_data_json = self._batch_serialize_obs_data(obs_df)
-            
-            # Use tqdm for the main batch progress
-            with tqdm(total=total_batches, desc="Processing cell batches", unit="batch") as main_pbar:
-                for batch_num, batch_start in enumerate(range(0, total_cells, cell_batch_size), 1):
-                    interrupt_handler.check_interrupted()
-                    
-                    batch_end = min(batch_start + cell_batch_size, total_cells)
-                    batch_size_actual = batch_end - batch_start
-                    
-                    main_pbar.set_description(f"Batch {batch_num}/{total_batches}")
-                    
-                    # Vectorized cell record preparation
-                    cell_records = self._prepare_cell_records_vectorized(
-                        dataset_id, batch_start, batch_end, cell_ids, sample_ids,
-                        patient_ids, cell_types, mapping_strategies, obs_data_json, obs_df
-                    )
-                    
-                    # Insert cell records
-                    logger.debug(f"Inserting {len(cell_records)} cell records")
-                    self.integration.insert_cells(cell_records)
-                    
-                    interrupt_handler.check_interrupted()
-                    
-                    # Process expression data with optimized batching
-                    logger.debug(f"Processing expression data for batch {batch_num}")
-                    self._stream_expression_batch_ultra_optimized(
-                        adata_stream, dataset_id, batch_start, batch_end, 
-                        valid_gene_indices, matrix_type, cell_ids[batch_start:batch_end],
-                        expr_batch_size
-                    )
-                    
-                    # Update main progress bar
-                    main_pbar.update(1)
-                    main_pbar.set_postfix({
-                        'cells': f"{batch_end:,}/{total_cells:,}",
-                        'genes': len(valid_gene_indices)
-                    })
-            
-        finally:
-            # Always close file handle
-            adata_stream.file.close()
-            click.echo("✅ Streaming import completed")
+            logger.info("Step 1: Checking h5ad file dimensions (metadata only)...")
+            n_obs, n_vars = self._get_h5ad_dimensions(file)
+            logger.info(f"Step 1 done: {n_obs} cells, {n_vars} genes")
+            logger.info(f"✅ Found h5ad file: {n_obs:,} cells, {n_vars:,} genes")
 
-    def _stream_expression_batch_optimized(
-        self,
-        adata_stream: anndata.AnnData,
-        dataset_id: str,
-        batch_start: int,
-        batch_end: int,
-        valid_gene_indices: List[int],
-        matrix_type: str,
-        cell_records: List[Dict[str, Any]],
-    ) -> None:
-        """Optimized expression streaming with persistent file handle."""
-        
-        # Select appropriate matrix without reopening file
-        logger.debug(f"Reading expression matrix slice [{batch_start}:{batch_end}, :]")
-        
-        if matrix_type == "raw" and adata_stream.raw is not None:
-            X_batch = adata_stream.raw.X[batch_start:batch_end, :]
-        elif matrix_type == "normalized" and "normalized" in adata_stream.layers:
-            X_batch = adata_stream.layers["normalized"][batch_start:batch_end, :]
-        elif matrix_type == "scaled" and "scaled" in adata_stream.layers:
-            X_batch = adata_stream.layers["scaled"][batch_start:batch_end, :]
-        else:
-            X_batch = adata_stream.X[batch_start:batch_end, :]
-        
-        logger.debug(f"Matrix slice shape: {X_batch.shape}, sparse: {sparse.issparse(X_batch)}")
-        
-        # Convert to sparse if needed
-        if not sparse.issparse(X_batch):
-            X_batch = sparse.csr_matrix(X_batch)
-        
-        # Filter to valid genes only
-        X_batch = X_batch[:, valid_gene_indices]
-        logger.debug(f"Filtered to {len(valid_gene_indices)} valid genes, new shape: {X_batch.shape}")
-        
-        # Convert to COO format for efficient iteration
-        X_coo = X_batch.tocoo()
-        nnz = X_coo.nnz
-        logger.debug(f"Non-zero values: {nnz}")
-        
-        # Prepare expression records
-        expression_records = []
-        cell_ids = [record["cell_id"] for record in cell_records]
-        
-        # Convert sparse matrix to records
-        for i, j, value in zip(X_coo.row, X_coo.col, X_coo.data):
-            if value != 0:  # Extra safety check for zero values
-                expression_records.append([
-                    dataset_id,
-                    cell_ids[i],
-                    valid_gene_indices[j],
-                    matrix_type,
-                    float(value)
-                ])
-        
-        # Insert expression data
-        if expression_records:
-            logger.debug(f"Inserting {len(expression_records)} expression values")
-            columns = ["dataset_id", "cell_id", "gene_idx", "matrix_type", "count"]
-            self.client.bulk_insert(
-                f"{self.client.table_prefix}expression_matrix",
-                expression_records,
-                columns,
-                batch_size=self.batch_size,
-                desc=f"Expression batch {batch_start//self.batch_size + 1}"
+            logger.info("Step 2: Opening h5ad file in backed mode...")
+            adata = anndata.read_h5ad(file, backed='r')
+            logger.info("Step 2 done: h5ad opened in backed mode")
+
+            logger.info("Step 3: Resolving sample/patient mappings...")
+            resolved_mappings, mapping_stats = self.mapper.resolve_mappings(
+                adata, study_id, sample_obs_column, patient_obs_column,
+                sample_mapping_file, patient_mapping_file
             )
+            logger.info("Step 3 done: mappings resolved")
+
+            logger.info("Step 4: Mapping genes to cBioPortal...")
+            gene_mapping = self._map_genes_to_cbioportal(adata, dataset_id)
+            logger.info("Step 4 done: gene mapping complete")
+
+            logger.info("Step 5: Preparing dataset/cell/gene records...")
+            dataset_record = self._prepare_dataset_record(
+                adata, dataset_id, study_id, file, description, mapping_stats
+            )
+            cell_records = self._prepare_cell_records(adata, dataset_id, resolved_mappings, cell_type_column)
+            gene_records = self._prepare_gene_records(dataset_id, gene_mapping)
+            logger.info("Step 5 done: records prepared")
+
+            logger.info("Step 6: Writing datasets Parquet...")
+            datasets_path = os.path.join(output_dir, f"{self.client.table_prefix}datasets.parquet")
+            pd.DataFrame([dataset_record]).to_parquet(datasets_path, index=False)
+            logger.info("Step 6a done: datasets Parquet written")
+
+            logger.info("Step 7: Writing cells Parquet...")
+            cells_path = os.path.join(output_dir, f"{self.client.table_prefix}cells.parquet")
+            pd.DataFrame(cell_records).to_parquet(cells_path, index=False)
+            logger.info("Step 7a done: cells Parquet written")
+
+            logger.info("Step 8: Writing genes Parquet...")
+            genes_path = os.path.join(output_dir, f"{self.client.table_prefix}dataset_genes.parquet")
+            pd.DataFrame(gene_records).to_parquet(genes_path, index=False)
+            logger.info("Step 8a done: genes Parquet written")
+
+            logger.info("Step 9: Writing expression matrix Parquet in batches...")
+            n_cells = adata.n_obs
+            n_genes = adata.n_vars
+            if matrix_type == "raw" and adata.raw is not None:
+                X = adata.raw.X
+            elif matrix_type == "normalized" and "normalized" in adata.layers:
+                X = adata.layers["normalized"]
+            elif matrix_type == "scaled" and "scaled" in adata.layers:
+                X = adata.layers["scaled"]
+            else:
+                X = adata.X
+            for batch_idx, start in enumerate(tqdm(range(0, n_cells, batch_size), desc="Exporting expression matrix", unit="batch")):
+                if interrupted:
+                    logger.warning("Export interrupted by user. Partial Parquet files may exist.")
+                    break
+                end = min(start + batch_size, n_cells)
+                logger.info(f"Processing expression batch: rows {start} to {end}")
+                t0 = time.perf_counter()
+                X_batch = X[start:end, :]
+                t1 = time.perf_counter()
+                logger.debug(f"  Slice X: {t1 - t0:.3f}s")
+
+                t0 = time.perf_counter()
+                if not sparse.issparse(X_batch):
+                    X_batch = sparse.csr_matrix(X_batch)
+                t1 = time.perf_counter()
+                logger.debug(f"  To sparse: {t1 - t0:.3f}s")
+
+                t0 = time.perf_counter()
+                X_coo = X_batch.tocoo()
+                t1 = time.perf_counter()
+                logger.debug(f"  To COO: {t1 - t0:.3f}s")
+
+                t0 = time.perf_counter()
+                cell_ids = [cell_records[i + start]["cell_id"] for i in range(end - start)]
+                t1 = time.perf_counter()
+                logger.debug(f"  Build cell_ids: {t1 - t0:.3f}s")
+
+                t0 = time.perf_counter()
+                table = pa.table({
+                    "dataset_id": pa.array([dataset_id] * len(X_coo.row)),
+                    "cell_id": pa.array([cell_ids[i] for i in X_coo.row]),
+                    "gene_idx": pa.array(X_coo.col),
+                    "matrix_type": pa.array([matrix_type] * len(X_coo.row)),
+                    "count": pa.array(X_coo.data)
+                })
+                pq.write_table(table, os.path.join(output_dir, f"{self.client.table_prefix}expression_batch_{batch_idx}.parquet"), compression=None)
+                t1 = time.perf_counter()
+                logger.debug(f"  Write Parquet: {t1 - t0:.3f}s")
+
+                del X_batch, X_coo, table
+                gc.collect()
+            logger.info("Step 9a done: expression matrix Parquet batches written")
+
+            embedding_data = self._prepare_embedding_data(adata, dataset_id, cell_records)
+            if embedding_data:
+                logger.info("Step 10: Writing embeddings Parquet...")
+                emb_data, emb_columns = embedding_data
+                emb_path = os.path.join(output_dir, f"{self.client.table_prefix}cell_embeddings.parquet")
+                emb_df = pd.DataFrame(emb_data, columns=emb_columns)
+                emb_df.to_parquet(emb_path, index=False)
+                logger.info("Step 10a done: embeddings Parquet written")
+
+            adata.file.close()
+            logger.info(f"✓ Parquet files written to {output_dir}")
+        except KeyboardInterrupt:
+            logger.warning("KeyboardInterrupt received. Cleaning up and exiting...")
+            try:
+                adata.file.close()
+            except Exception:
+                pass
+            raise
+        finally:
+            signal.signal(signal.SIGINT, old_handler)
+
+    def load_parquets_to_clickhouse(
+        self,
+        parquet_dir: str,
+        dataset_id: str,
+        study_id: str,
+    ) -> None:
+        """
+        Load Parquet files from parquet_dir into ClickHouse tables using clickhouse-client with FORMAT Parquet.
+        """
+        import os
+        import subprocess
+        import glob
+        import click
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        table_files = [
+            (f"{self.client.table_prefix}datasets.parquet", f"{self.client.table_prefix}datasets"),
+            (f"{self.client.table_prefix}cells.parquet", f"{self.client.table_prefix}cells"),
+            (f"{self.client.table_prefix}dataset_genes.parquet", f"{self.client.table_prefix}dataset_genes"),
+            (f"{self.client.table_prefix}cell_embeddings.parquet", f"{self.client.table_prefix}cell_embeddings"),
+        ]
+
+        for parquet_name, table_name in table_files:
+            parquet_path = os.path.join(parquet_dir, parquet_name)
+            if not os.path.exists(parquet_path):
+                if table_name == f"{self.client.table_prefix}cell_embeddings":
+                    continue  # embeddings are optional
+                click.echo(f"[WARN] Parquet not found: {parquet_path}, skipping {table_name}")
+                continue
+            click.echo(f"Importing {parquet_path} into {table_name} ...")
+            full_table_name = f"{self.client.database}.{table_name}"
+            command = (
+                f"clickhouse-client --host {self.client.config.get('host', 'localhost')} "
+                f"--user {self.client.config.get('username', 'default')} "
+                f"--password '{self.client.config.get('password', '')}' "
+                f"--database {self.client.database} "
+                f'--query "INSERT INTO {full_table_name} FORMAT Parquet" '
+                f'< "{parquet_path}"'
+            )
+            try:
+                result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
+                logger.info(f"Successfully imported {parquet_path} into {full_table_name}")
+                click.echo(f"✓ Imported {table_name}")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Import failed for {table_name}: {e}")
+                if e.stderr:
+                    logger.error(f"clickhouse-client stderr: {e.stderr}")
+                click.echo(f"[ERROR] Import failed for {table_name}. See logs for details.")
+                raise
+
+        # Import all expression matrix batch Parquet files
+        expr_pattern = os.path.join(parquet_dir, f"{self.client.table_prefix}expression_batch_*.parquet")
+        expr_files = sorted(glob.glob(expr_pattern))
+        if not expr_files:
+            click.echo(f"[WARN] No expression matrix Parquet files found in {parquet_dir}")
         else:
-            logger.debug("No expression values to insert for this batch")
+            table_name = f"{self.client.table_prefix}expression_matrix"
+            full_table_name = f"{self.client.database}.{table_name}"
+            for expr_file in expr_files:
+                click.echo(f"Importing {expr_file} into {table_name} ...")
+                command = (
+                    f"clickhouse-client --host {self.client.config.get('host', 'localhost')} "
+                    f"--user {self.client.config.get('username', 'default')} "
+                    f"--password '{self.client.config.get('password', '')}' "
+                    f"--database {self.client.database} "
+                    f'--query "INSERT INTO {full_table_name} FORMAT Parquet" '
+                    f'< "{expr_file}"'
+                )
+                try:
+                    result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
+                    logger.info(f"Successfully imported {expr_file} into {full_table_name}")
+                    click.echo(f"✓ Imported {expr_file}")
+                except subprocess.CalledProcessError as e:
+                    logger.error(f"Import failed for {expr_file}: {e}")
+                    if e.stderr:
+                        logger.error(f"clickhouse-client stderr: {e.stderr}")
+                    click.echo(f"[ERROR] Import failed for {expr_file}. See logs for details.")
+                    raise
+        click.echo(f"✓ All available Parquet files imported from {parquet_dir}")
